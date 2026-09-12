@@ -147,15 +147,25 @@ static UINT                             g_frame_slot = 0;
 static ComPtr<ID3D12Fence>              g_sync_fence;
 static UINT64                           g_sync_value = 0;
 
-static NVSDK_NGX_Parameter *g_params = nullptr;
-static NVSDK_NGX_Handle    *g_feature = nullptr;
+// A/B/C are independent feature-18 instances (own params + temporal history) used
+// to build the 1x/2x/3x multipass cascade: 1x=A, 2x=B->A, 3x=B->C->A.
+static NVSDK_NGX_Parameter *g_params_a = nullptr;
+static NVSDK_NGX_Parameter *g_params_b = nullptr;
+static NVSDK_NGX_Parameter *g_params_c = nullptr;
+static NVSDK_NGX_Handle    *g_feature_a = nullptr;
+static NVSDK_NGX_Handle    *g_feature_b = nullptr;
+static NVSDK_NGX_Handle    *g_feature_c = nullptr;
 static bool                 g_ngx_initialized = false;
+static int                  g_nr_passes = 1;      // user-selected pass count (1/2/3)
+static int                  g_nr_max_passes = 1;  // highest pass count this session actually supports
 
 static ComPtr<ID3D12Resource> g_y_tex;       // R8_UNORM Y plane (W x H)
 static ComPtr<ID3D12Resource> g_uv_tex;      // R8G8_UNORM UV plane (W/2 x H/2)
 static ComPtr<ID3D12Resource> g_staging;     // UPLOAD heap: Y (padded) + UV (padded)
 static ComPtr<ID3D12Resource> g_nr_in;       // R16G16B16A16_FLOAT NR input
 static ComPtr<ID3D12Resource> g_nr_out;      // R16G16B16A16_FLOAT NR output
+static ComPtr<ID3D12Resource> g_nr_mid1;     // R16G16B16A16_FLOAT cascade intermediate (B output / A or C input)
+static ComPtr<ID3D12Resource> g_nr_mid2;     // R16G16B16A16_FLOAT cascade intermediate (C output / A input, 3x only)
 static ComPtr<ID3D12Resource> g_stage_rgba;  // R8G8B8A8 NR output (cs2 UAV)
 static ComPtr<ID3D12Resource> g_orig_rgba;   // R8G8B8A8 "original" (side-by-side left)
 static ComPtr<ID3D12DescriptorHeap> g_cbv_heap;
@@ -168,6 +178,7 @@ static ComPtr<IDXGISwapChain3> g_swap;
 static HWND g_hwnd = nullptr;
 static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
 static HWND g_split_button = nullptr, g_dlss_button = nullptr, g_model_button = nullptr;
+static HWND g_passes_button = nullptr;
 static HWND g_prev_frame_button = nullptr, g_next_frame_button = nullptr;
 static HWND g_volume_slider = nullptr, g_volume_label = nullptr, g_mute_button = nullptr;
 static bool g_gui = false, g_media_loaded = false;
@@ -357,6 +368,109 @@ static ComPtr<ID3D12Resource> MakeTex(UINT w, UINT h, DXGI_FORMAT fmt, D3D12_RES
 }
 
 // ---------------------------------------------------------------------------
+// per-stage NR feature helpers (each stage = its own params + handle/history)
+// ---------------------------------------------------------------------------
+static void ConfigureNRParams(NVSDK_NGX_Parameter *params, UINT w, UINT h)
+{
+    params->Set("DLSSNR.Width", w);
+    params->Set("DLSSNR.Height", h);
+    params->Set("DLSSNR.Enabled", 1);
+    params->Set("DLSSNR.Reset", 1);
+    params->Set("DLSSNR.Style", StyleValue());
+    params->Set("DLSSNR.Hint.Render.Preset", g_preset);
+    params->Set("DLSSNR.Intensity", (float)g_intensity);
+    params->Set("DLSSNR.LocalToneStrength", (float)g_tone);
+    params->Set("DLSSNR.LocalStructureStrength", (float)g_structure);
+    params->Set("DLSSNR.SkinStructureStrength", (float)g_skin);
+    params->Set("DLSSNR.UseAutoMask", g_mask);
+    params->Set("DLSSNR.UICorrection", 0);
+    params->Set("DLSSNR.DepthInverted", 1);
+    params->Set("DLSSNR.ScalingRatio", 1.0f);
+    params->Set("DLSSNR.MVecScaleX", 1.0f);
+    params->Set("DLSSNR.MVecScaleY", 1.0f);
+    params->Set("DLSSNR.ColorSubrectBaseX", 0);
+    params->Set("DLSSNR.ColorSubrectBaseY", 0);
+    params->Set("DLSSNR.ColorSubrectWidth", w);
+    params->Set("DLSSNR.ColorSubrectHeight", h);
+    params->Set("DLSSNR.OutputSubrectBaseX", 0);
+    params->Set("DLSSNR.OutputSubrectBaseY", 0);
+    params->Set("DLSSNR.OutputSubrectWidth", w);
+    params->Set("DLSSNR.OutputSubrectHeight", h);
+}
+
+static void DestroyNGXParams(NVSDK_NGX_Parameter *&params)
+{
+    if (params && g_core_module)
+    {
+        auto destroy = (NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter *))GetProcAddress(
+            g_core_module, "NVSDK_NGX_D3D12_DestroyParameters");
+        if (destroy) destroy(params);
+    }
+    params = nullptr;
+}
+
+// Allocates params + creates a feature-18 instance on the (already open) g_list.
+// Caller batches A/B/C creation on one command list, then executes it once.
+static bool CreateNRFeature(UINT w, UINT h, NVSDK_NGX_Parameter **paramsOut, NVSDK_NGX_Handle **featureOut, const char *label)
+{
+    NVSDK_NGX_Parameter *params = nullptr;
+    NVSDK_NGX_Result ra = g_alloc(&params);
+    if (ra != NGX_SUCCESS || !params) { Log("FAIL: AllocateParameters (%s)", label); return false; }
+    ConfigureNRParams(params, w, h);
+
+    NVSDK_NGX_Handle *feature = nullptr;
+    NVSDK_NGX_Result rc;
+    if (g_nr_create && g_shim_create)
+        rc = g_shim_create((void *)g_nr_create, g_list.Get(), NR_FEATURE_ID, params, &feature);
+    else
+        rc = g_create(g_list.Get(), NR_FEATURE_ID, params, &feature);
+    if (rc != NGX_SUCCESS || !feature)
+    {
+        Log("FAIL: CreateFeature(18) %s -> 0x%08X", label, (unsigned)rc);
+        DestroyNGXParams(params);
+        return false;
+    }
+    *paramsOut = params;
+    *featureOut = feature;
+    Log("NR feature %s created: handle=%p", label, feature);
+    return true;
+}
+
+static void ReleaseNRFeature(NVSDK_NGX_Handle *&feature, NVSDK_NGX_Parameter *&params)
+{
+    if (feature && g_nr_release)
+    {
+        if (g_shim_release) g_shim_release((void *)g_nr_release, feature);
+        else if (g_release) g_release(feature);
+    }
+    feature = nullptr;
+    DestroyNGXParams(params);
+}
+
+// Points a stage at its input/output resources and evaluates it in-place on g_list.
+static void EvaluateNRStage(NVSDK_NGX_Parameter *params, NVSDK_NGX_Handle *feature,
+                            ID3D12Resource *color, ID3D12Resource *output, bool reset, const char *label)
+{
+    params->Set("DLSSNR.Color", color);
+    params->Set("DLSSNR.Output", output);
+    params->Set("DLSSNR.Backbuffer", output);
+    params->Set("DLSSNR.Reset", reset ? 1 : 0);
+    NVSDK_NGX_Result re;
+    if (g_nr_eval && g_shim_eval)
+        re = g_shim_eval((void *)g_nr_eval, g_list.Get(), feature, params, nullptr);
+    else
+        re = g_eval(g_list.Get(), feature, params, nullptr);
+    if (re != NGX_SUCCESS) Log("Evaluate(%s) -> 0x%08X", label, (unsigned)re);
+}
+
+static void SetAllNRStyles(int style)
+{
+    if (g_params_a) g_params_a->Set("DLSSNR.Style", style);
+    if (g_params_b) g_params_b->Set("DLSSNR.Style", style);
+    if (g_params_c) g_params_c->Set("DLSSNR.Style", style);
+}
+
+// ---------------------------------------------------------------------------
 // NGX init (Init_ProjectID + shim + snippet, feature 18)
 // ---------------------------------------------------------------------------
 static bool SetupNGX(UINT w, UINT h)
@@ -439,75 +553,43 @@ static bool SetupNGX(UINT w, UINT h)
         Log("snippet Init_Ext (via shim) -> 0x%08X", (unsigned)r);
     }
 
-    NVSDK_NGX_Result ra = g_alloc(&g_params);
-    if (ra != NGX_SUCCESS || !g_params) { Log("FAIL: AllocateParameters"); return false; }
+    g_nr_max_passes = 0;
+    if (!CreateNRFeature(w, h, &g_params_a, &g_feature_a, "A"))
+        return false;
+    g_nr_max_passes = 1;
 
-    int style_int = StyleValue();
-
-    g_params->Set("DLSSNR.Width", w);
-    g_params->Set("DLSSNR.Height", h);
-    g_params->Set("DLSSNR.Enabled", 1);
-    g_params->Set("DLSSNR.Reset", 1);
-    g_params->Set("DLSSNR.Style", style_int);
-    g_params->Set("DLSSNR.Hint.Render.Preset", g_preset);
-    g_params->Set("DLSSNR.Intensity", (float)g_intensity);
-    g_params->Set("DLSSNR.LocalToneStrength", (float)g_tone);
-    g_params->Set("DLSSNR.LocalStructureStrength", (float)g_structure);
-    g_params->Set("DLSSNR.SkinStructureStrength", (float)g_skin);
-    g_params->Set("DLSSNR.UseAutoMask", g_mask);
-    g_params->Set("DLSSNR.UICorrection", 0);
-    g_params->Set("DLSSNR.DepthInverted", 1);
-    g_params->Set("DLSSNR.ScalingRatio", 1.0f);
-    g_params->Set("DLSSNR.MVecScaleX", 1.0f);
-    g_params->Set("DLSSNR.MVecScaleY", 1.0f);
-    g_params->Set("DLSSNR.Color", g_nr_in.Get());
-    g_params->Set("DLSSNR.Output", g_nr_out.Get());
-    g_params->Set("DLSSNR.Backbuffer", g_nr_out.Get());
-    g_params->Set("DLSSNR.ColorSubrectBaseX", 0);
-    g_params->Set("DLSSNR.ColorSubrectBaseY", 0);
-    g_params->Set("DLSSNR.ColorSubrectWidth", w);
-    g_params->Set("DLSSNR.ColorSubrectHeight", h);
-    g_params->Set("DLSSNR.OutputSubrectBaseX", 0);
-    g_params->Set("DLSSNR.OutputSubrectBaseY", 0);
-    g_params->Set("DLSSNR.OutputSubrectWidth", w);
-    g_params->Set("DLSSNR.OutputSubrectHeight", h);
-
-    if (g_nr_create && g_shim_create)
+    if (CreateNRFeature(w, h, &g_params_b, &g_feature_b, "B"))
     {
-        NVSDK_NGX_Result rc = g_shim_create((void *)g_nr_create, g_list.Get(), NR_FEATURE_ID, g_params, &g_feature);
-        if (rc != NGX_SUCCESS || !g_feature)
-            { Log("FAIL: CreateFeature(18) via shim -> 0x%08X", (unsigned)rc); return false; }
+        g_nr_max_passes = 2;
+        if (CreateNRFeature(w, h, &g_params_c, &g_feature_c, "C"))
+            g_nr_max_passes = 3;
+        else
+            Log("NR feature C creation failed; limiting multipass to 2x");
     }
     else
     {
-        NVSDK_NGX_Result rc = g_create(g_list.Get(), NR_FEATURE_ID, g_params, &g_feature);
-        if (rc != NGX_SUCCESS || !g_feature)
-            { Log("FAIL: CreateFeature(18) -> 0x%08X", (unsigned)rc); return false; }
+        Log("NR feature B creation failed; limiting multipass to 1x");
     }
-    Log("NR feature created, handle=%p", g_feature);
+    Log("DLSS 5 multipass available: %d pass%s", g_nr_max_passes, g_nr_max_passes == 1 ? "" : "es");
     ExecuteAndWait();
+
+    if (g_nr_passes > g_nr_max_passes)
+    {
+        Log("requested %d passes but only %d supported; clamping", g_nr_passes, g_nr_max_passes);
+        g_nr_passes = g_nr_max_passes;
+    }
     return true;
 }
 
 static void ReleaseNGXObjects()
 {
-    if (g_feature && g_nr_release)
-    {
-        if (g_shim_release) g_shim_release((void *)g_nr_release, g_feature);
-        else if (g_release) g_release(g_feature);
-    }
-    g_feature = nullptr;
-
-    if (g_params && g_core_module)
-    {
-        auto destroy = (NVSDK_NGX_Result (*)(NVSDK_NGX_Parameter *))GetProcAddress(
-            g_core_module, "NVSDK_NGX_D3D12_DestroyParameters");
-        if (destroy) destroy(g_params);
-    }
-    g_params = nullptr;
+    ReleaseNRFeature(g_feature_c, g_params_c);
+    ReleaseNRFeature(g_feature_b, g_params_b);
+    ReleaseNRFeature(g_feature_a, g_params_a);
 
     if (g_ngx_initialized && g_shutdown) g_shutdown();
     g_ngx_initialized = false;
+    g_nr_max_passes = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -630,7 +712,7 @@ static void UpdateModeTitle()
                          (g_nr_enabled ? L"DLSS 5 ON" : L"DLSS 5 OFF - Original"));
     std::wstring title = L"DLSS5 NR player - ";
     title += mode;
-    title += g_nr_available ? L"  [S: compare | D: DLSS on/off | M: model | Left/Right: frame]" :
+    title += g_nr_available ? L"  [S: compare | D: DLSS on/off | M: model | P: passes | Left/Right: frame]" :
                               L"  [Left/Right: frame | Space: pause]";
     SetWindowTextW(g_hwnd, title.c_str());
     SetWindowTextW(g_split_button, !g_nr_available ? L"Split: N/A" : (g_side ? L"Split: ON" : L"Split: OFF"));
@@ -640,9 +722,17 @@ static void UpdateModeTitle()
     std::wstring modelText = g_nr_available ? L"Model: " : L"Model: N/A";
     if (g_nr_available) modelText += StyleName();
     SetWindowTextW(g_model_button, modelText.c_str());
+    if (g_nr_available) {
+        wchar_t passesText[32];
+        swprintf_s(passesText, L"Passes: %dx", g_nr_passes);
+        SetWindowTextW(g_passes_button, passesText);
+    } else {
+        SetWindowTextW(g_passes_button, L"Passes: N/A");
+    }
     EnableWindow(g_split_button, g_nr_available);
     EnableWindow(g_dlss_button, g_nr_available && !g_side);
     EnableWindow(g_model_button, g_nr_available);
+    EnableWindow(g_passes_button, g_nr_available);
     EnableWindow(g_pause_button, g_media_loaded);
     EnableWindow(g_prev_frame_button, g_media_loaded);
     EnableWindow(g_next_frame_button, g_media_loaded);
@@ -685,11 +775,24 @@ static void CycleModel()
     if (next < 0 || next > 2) next = 0;
     static const char *styles[] = { "default", "natural", "cinematic" };
     g_style = styles[next];
-    if (g_params) g_params->Set("DLSSNR.Style", next);
+    SetAllNRStyles(next);
     g_nr_reset = true;
     g_refresh_view = true;
     UpdateModeTitle();
     Log("DLSS 5 model: %s", g_style.c_str());
+}
+
+static void CyclePasses()
+{
+    if (!g_nr_available) return;
+    int next = g_nr_passes + 1;
+    if (next > g_nr_max_passes) next = 1;
+    g_nr_passes = next;
+    g_nr_reset = true;
+    g_refresh_view = true;
+    UpdateModeTitle();
+    Log("DLSS NR passes: %d%s", g_nr_passes,
+        g_nr_passes == 1 ? "" : (g_nr_passes == 2 ? " (B -> A)" : " (B -> C -> A)"));
 }
 
 // Caller holds g_audio_lock so changing volume cannot race device replacement.
@@ -814,7 +917,8 @@ static void LayoutControls(HWND hwnd)
     struct Control { HWND window; int width; };
     Control buttons[] = {{g_pause_button, 72}, {g_prev_frame_button, 64},
         {g_next_frame_button, 64}, {g_split_button, 90}, {g_dlss_button, 100},
-        {g_model_button, 130}};
+        {g_model_button, 130}, {g_passes_button, 100}};
+    const int NUM_BUTTONS = 7;
     int x = 6, row = 0;
     auto place = [&](int controlWidth) {
         if (x > 6 && x + controlWidth > width - 6) { x = 6; ++row; }
@@ -822,13 +926,13 @@ static void LayoutControls(HWND hwnd)
         x += controlWidth + 6;
         return pos;
     };
-    POINT positions[6];
-    for (int i = 0; i < 6; ++i) positions[i] = place(buttons[i].width);
+    POINT positions[NUM_BUTTONS];
+    for (int i = 0; i < NUM_BUTTONS; ++i) positions[i] = place(buttons[i].width);
     POINT audio = place(280);
     int seekY = (row + 1) * 36 + 6;
     int videoHeight = std::max(1, height - (seekY + 34));
     if (g_video_hwnd) MoveWindow(g_video_hwnd, 0, 0, width, videoHeight, TRUE);
-    for (int i = 0; i < 6; ++i)
+    for (int i = 0; i < NUM_BUTTONS; ++i)
         if (buttons[i].window) MoveWindow(buttons[i].window, positions[i].x,
             videoHeight + positions[i].y, buttons[i].width, 28, TRUE);
     if (g_mute_button) MoveWindow(g_mute_button, audio.x, videoHeight + audio.y, 70, 28, TRUE);
@@ -869,6 +973,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if ((HWND)lp == g_split_button && HIWORD(wp) == BN_CLICKED) { ToggleComparison(); return 0; }
         if ((HWND)lp == g_dlss_button && HIWORD(wp) == BN_CLICKED) { ToggleNR(); return 0; }
         if ((HWND)lp == g_model_button && HIWORD(wp) == BN_CLICKED) { CycleModel(); return 0; }
+        if ((HWND)lp == g_passes_button && HIWORD(wp) == BN_CLICKED) { CyclePasses(); return 0; }
         if ((HWND)lp == g_mute_button && HIWORD(wp) == BN_CLICKED) { ToggleMute(); return 0; }
         break;
     case WM_KEYDOWN: if (wp == VK_ESCAPE) { g_running = false; } return 0;
@@ -949,6 +1054,8 @@ static bool SetupWindow(UINT w, UINT h)
                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_model_button = CreateWindowExW(0, L"BUTTON", L"Model: Natural", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                     0, 0, 130, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_passes_button = CreateWindowExW(0, L"BUTTON", L"Passes: 1x", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_mute_button = CreateWindowExW(0, L"BUTTON", L"Mute", toggleStyle,
                                    0, 0, 70, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_volume_label = CreateWindowExW(0, L"STATIC", L"Volume: 100%", WS_CHILD | WS_VISIBLE,
@@ -964,7 +1071,7 @@ static bool SetupWindow(UINT w, UINT h)
                                  0, h, dw, TBH, g_hwnd, nullptr, wc.hInstance, nullptr);
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
     if (!g_video_hwnd || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
-        !g_split_button || !g_dlss_button || !g_model_button || !g_trackbar ||
+        !g_split_button || !g_dlss_button || !g_model_button || !g_passes_button || !g_trackbar ||
         !g_mute_button || !g_volume_label || !g_volume_slider) return false;
     if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) return false;
     LayoutControls(g_hwnd);
@@ -1318,13 +1425,37 @@ static void RenderFrame(const uint8_t *nv12)
 
     bool useNR = g_nr_available && (g_side || g_nr_enabled);
     if (useNR) {
-        g_params->Set("DLSSNR.Reset", (g_frame_index == 0 || g_nr_reset) ? 1 : 0);
-        NVSDK_NGX_Result re;
-        if (g_nr_eval && g_shim_eval)
-            re = g_shim_eval((void *)g_nr_eval, g_list.Get(), g_feature, g_params, nullptr);
+        bool reset = (g_frame_index == 0 || g_nr_reset);
+        int passes = g_nr_passes;
+
+        if (passes <= 1)
+        {
+            EvaluateNRStage(g_params_a, g_feature_a, g_nr_in.Get(), g_nr_out.Get(), reset, "A");
+        }
+        else if (passes == 2)
+        {
+            EvaluateNRStage(g_params_b, g_feature_b, g_nr_in.Get(), g_nr_mid1.Get(), reset, "B");
+            D3D12_RESOURCE_BARRIER mb = Trans(g_nr_mid1.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            g_list->ResourceBarrier(1, &mb);
+            EvaluateNRStage(g_params_a, g_feature_a, g_nr_mid1.Get(), g_nr_out.Get(), reset, "A");
+            D3D12_RESOURCE_BARRIER rb = Trans(g_nr_mid1.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            g_list->ResourceBarrier(1, &rb);
+        }
         else
-            re = g_eval(g_list.Get(), g_feature, g_params, nullptr);
-        if (re != NGX_SUCCESS) Log("Evaluate -> 0x%08X", (unsigned)re);
+        {
+            EvaluateNRStage(g_params_b, g_feature_b, g_nr_in.Get(), g_nr_mid1.Get(), reset, "B");
+            D3D12_RESOURCE_BARRIER mb1 = Trans(g_nr_mid1.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            g_list->ResourceBarrier(1, &mb1);
+            EvaluateNRStage(g_params_c, g_feature_c, g_nr_mid1.Get(), g_nr_mid2.Get(), reset, "C");
+            D3D12_RESOURCE_BARRIER mb2 = Trans(g_nr_mid2.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            g_list->ResourceBarrier(1, &mb2);
+            EvaluateNRStage(g_params_a, g_feature_a, g_nr_mid2.Get(), g_nr_out.Get(), reset, "A");
+            D3D12_RESOURCE_BARRIER rbs[2] = {
+                Trans(g_nr_mid1.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                Trans(g_nr_mid2.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            };
+            g_list->ResourceBarrier(2, rbs);
+        }
         g_nr_reset = false;
     }
 
@@ -1486,6 +1617,10 @@ static int PlayVideo(const std::wstring &input)
                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     g_nr_out  = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    g_nr_mid1 = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    g_nr_mid2 = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     g_stage_rgba = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     g_orig_rgba  = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
@@ -1575,12 +1710,13 @@ static int PlayVideo(const std::wstring &input)
         {
             if (msg.message == WM_QUIT) { g_running = false; break; }
             if (msg.message == WM_KEYDOWN && msg.wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) { OpenVideoDialog(g_hwnd); continue; }
-            if (msg.message == WM_KEYDOWN && (msg.wParam == 'S' || msg.wParam == 'D' || msg.wParam == 'M'))
+            if (msg.message == WM_KEYDOWN && (msg.wParam == 'S' || msg.wParam == 'D' || msg.wParam == 'M' || msg.wParam == 'P'))
             {
                 if (!(msg.lParam & (1LL << 30))) {
                     if (msg.wParam == 'S') ToggleComparison();
                     else if (msg.wParam == 'D') ToggleNR();
-                    else CycleModel();
+                    else if (msg.wParam == 'M') CycleModel();
+                    else CyclePasses();
                 }
                 continue;
             }
@@ -1715,7 +1851,8 @@ static void CleanupPlayback()
     g_swap.Reset(); g_readback.Reset();
     g_pso_in.Reset(); g_pso_out.Reset(); g_rs.Reset(); g_cbv_heap.Reset();
     g_y_tex.Reset(); g_uv_tex.Reset(); g_staging.Reset(); g_nr_in.Reset();
-    g_nr_out.Reset(); g_stage_rgba.Reset(); g_orig_rgba.Reset(); g_list.Reset();
+    g_nr_out.Reset(); g_nr_mid1.Reset(); g_nr_mid2.Reset();
+    g_stage_rgba.Reset(); g_orig_rgba.Reset(); g_list.Reset();
     for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i) {
         g_cmd_alloc[i].Reset(); g_fence[i].Reset(); g_fence_value[i] = 0;
     }
@@ -1750,6 +1887,12 @@ int wmain(int argc, wchar_t **argv)
         else if (a == L"--structure" && i + 1 < argc) g_structure = _wtoi(argv[++i]);
         else if (a == L"--skin" && i + 1 < argc) g_skin = _wtoi(argv[++i]);
         else if (a == L"--mask" && i + 1 < argc) g_mask = _wtoi(argv[++i]);
+        else if (a == L"--passes" && i + 1 < argc)
+        {
+            int v = _wtoi(argv[++i]);
+            if (v < 1 || v > 3) { Log("invalid --passes value %d; must be 1, 2, or 3; using 1", v); v = 1; }
+            g_nr_passes = v;
+        }
         else if (a == L"--fast") g_fast = true;
         else if (a == L"--nr-only") g_side = false;
         else if (a == L"--side-by-side") g_side = true;
@@ -1790,6 +1933,7 @@ int wmain(int argc, wchar_t **argv)
             if (message.wParam == 'S') { ToggleComparison(); continue; }
             if (message.wParam == 'D') { ToggleNR(); continue; }
             if (message.wParam == 'M') { CycleModel(); continue; }
+            if (message.wParam == 'P') { CyclePasses(); continue; }
             if (message.wParam == VK_LEFT && message.hwnd != g_volume_slider) { RequestFrameStep(-1); continue; }
             if (message.wParam == VK_RIGHT && message.hwnd != g_volume_slider) { RequestFrameStep(1); continue; }
         }

@@ -16,6 +16,7 @@ This repository contains **source code only**. NVIDIA DLLs, the caller helper, F
 - **Split** button / **S**: toggle original (left) versus DLSS 5 (right). Split view defaults off.
 - **DLSS 5** button / **D**: toggle neural processing in single view. DLSS defaults on. Comparison always includes DLSS, so the DLSS toggle is disabled there; returning to single view restores the previous setting.
 - **Model** button / **M**: cycle between the Default, Natural, and Cinematic DLSS 5 models. The new model is applied immediately and also works while paused.
+- **Passes** button / **P**: cycle the DLSS 5 NR multipass cascade between 1x, 2x, and 3x. 1x is normal single-pass DLSS 5 NR; 2x runs a `B -> A` cascade; 3x runs a `B -> C -> A` cascade. Each stage (A/B/C) is an independent feature instance with its own temporal history, so 2x/3x can increase enhancement but may also increase temporal persistence, smearing/ghosting, settling time after cuts, and GPU load. Multipass uses the same existing DLSS NR runtime; no additional NVIDIA DLL is required. The button and hotkey are disabled when DLSS 5 NR is unavailable, and only cycle through the pass counts this session's runtime actually supports (2x/3x require the runtime to successfully create extra feature instances; the player logs and falls back automatically if it cannot).
 - View controls also work while paused. The title shows the current mode. **Esc** closes the player.
 - Build a single-file portable executable containing your locally supplied dependencies. It opens without a batch-file launcher.
 
@@ -88,6 +89,7 @@ Without `--gui`, a command-line input exits at EOF. The legacy `NR_player.bat` f
 | `--preset N` | Render preset (default 3) |
 | `--intensity N`, `--tone N`, `--structure N` | NR tuning |
 | `--skin N`, `--mask N` | Skin structure / automatic mask |
+| `--passes N` | DLSS 5 NR multipass cascade: `1` (default), `2` (`B -> A`), or `3` (`B -> C -> A`). Invalid values are clamped to 1 and logged; the value is also clamped to whatever pass count the runtime actually supports. |
 | `--fast` | Disable frame pacing |
 | `--output out.mp4` | Offline conversion with original audio |
 | `--crf N` | Output H.264 CRF (default 18) |
