@@ -114,6 +114,7 @@ typedef NVSDK_NGX_Result (*PFN_D3D12ReleaseFeature)(NVSDK_NGX_Handle *);
 typedef NVSDK_NGX_Result (*PFN_Shutdown)(void);
 
 static const int NR_FEATURE_ID = 18;
+static const int MAX_NR_PASSES = 11; // hard cap for the passes slider / probe loop
 
 // ---------------------------------------------------------------------------
 // globals
@@ -147,25 +148,22 @@ static UINT                             g_frame_slot = 0;
 static ComPtr<ID3D12Fence>              g_sync_fence;
 static UINT64                           g_sync_value = 0;
 
-// A/B/C are independent feature-18 instances (own params + temporal history) used
-// to build the 1x/2x/3x multipass cascade: 1x=A, 2x=B->A, 3x=B->C->A.
-static NVSDK_NGX_Parameter *g_params_a = nullptr;
-static NVSDK_NGX_Parameter *g_params_b = nullptr;
-static NVSDK_NGX_Parameter *g_params_c = nullptr;
-static NVSDK_NGX_Handle    *g_feature_a = nullptr;
-static NVSDK_NGX_Handle    *g_feature_b = nullptr;
-static NVSDK_NGX_Handle    *g_feature_c = nullptr;
+// Each entry is an independent feature-18 instance (own params + temporal history).
+// Index 0 is always the final/mandatory stage ("A"); higher indices are earlier
+// cascade stages applied first: N passes runs stage[N-1] -> ... -> stage[1] -> stage[0].
+static std::vector<NVSDK_NGX_Parameter *> g_nr_params;
+static std::vector<NVSDK_NGX_Handle *>    g_nr_features;
 static bool                 g_ngx_initialized = false;
-static int                  g_nr_passes = 1;      // user-selected pass count (1/2/3)
+static int                  g_nr_passes = 1;      // user-selected pass count (1..g_nr_max_passes)
 static int                  g_nr_max_passes = 1;  // highest pass count this session actually supports
+static bool                 g_multipass_enabled = false; // off by default: keeps startup/eval cost at the original single-pass baseline
 
 static ComPtr<ID3D12Resource> g_y_tex;       // R8_UNORM Y plane (W x H)
 static ComPtr<ID3D12Resource> g_uv_tex;      // R8G8_UNORM UV plane (W/2 x H/2)
 static ComPtr<ID3D12Resource> g_staging;     // UPLOAD heap: Y (padded) + UV (padded)
 static ComPtr<ID3D12Resource> g_nr_in;       // R16G16B16A16_FLOAT NR input
 static ComPtr<ID3D12Resource> g_nr_out;      // R16G16B16A16_FLOAT NR output
-static ComPtr<ID3D12Resource> g_nr_mid1;     // R16G16B16A16_FLOAT cascade intermediate (B output / A or C input)
-static ComPtr<ID3D12Resource> g_nr_mid2;     // R16G16B16A16_FLOAT cascade intermediate (C output / A input, 3x only)
+static std::vector<ComPtr<ID3D12Resource>> g_nr_mid; // MAX_NR_PASSES-1 cascade intermediates, mid[k] feeds stage[k]
 static ComPtr<ID3D12Resource> g_stage_rgba;  // R8G8B8A8 NR output (cs2 UAV)
 static ComPtr<ID3D12Resource> g_orig_rgba;   // R8G8B8A8 "original" (side-by-side left)
 static ComPtr<ID3D12DescriptorHeap> g_cbv_heap;
@@ -178,7 +176,8 @@ static ComPtr<IDXGISwapChain3> g_swap;
 static HWND g_hwnd = nullptr;
 static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
 static HWND g_split_button = nullptr, g_dlss_button = nullptr, g_model_button = nullptr;
-static HWND g_passes_button = nullptr;
+static HWND g_passes_slider = nullptr, g_passes_label = nullptr;
+static HWND g_multipass_checkbox = nullptr;
 static HWND g_prev_frame_button = nullptr, g_next_frame_button = nullptr;
 static HWND g_volume_slider = nullptr, g_volume_label = nullptr, g_mute_button = nullptr;
 static bool g_gui = false, g_media_loaded = false;
@@ -465,9 +464,8 @@ static void EvaluateNRStage(NVSDK_NGX_Parameter *params, NVSDK_NGX_Handle *featu
 
 static void SetAllNRStyles(int style)
 {
-    if (g_params_a) g_params_a->Set("DLSSNR.Style", style);
-    if (g_params_b) g_params_b->Set("DLSSNR.Style", style);
-    if (g_params_c) g_params_c->Set("DLSSNR.Style", style);
+    for (NVSDK_NGX_Parameter *p : g_nr_params)
+        if (p) p->Set("DLSSNR.Style", style);
 }
 
 // ---------------------------------------------------------------------------
@@ -553,22 +551,30 @@ static bool SetupNGX(UINT w, UINT h)
         Log("snippet Init_Ext (via shim) -> 0x%08X", (unsigned)r);
     }
 
+    g_nr_params.clear();
+    g_nr_features.clear();
     g_nr_max_passes = 0;
-    if (!CreateNRFeature(w, h, &g_params_a, &g_feature_a, "A"))
-        return false;
-    g_nr_max_passes = 1;
 
-    if (CreateNRFeature(w, h, &g_params_b, &g_feature_b, "B"))
+    // Stage 0 ("A") is mandatory. Higher stages (B, C, D, ...) are optional extra
+    // cascade depth; probe them one at a time and stop at the first failure so we
+    // learn how many concurrent feature-18 instances this GPU/driver actually supports.
+    // Skipped entirely when multipass is disabled, so startup/VRAM cost stays at the
+    // original single-pass baseline for the fastest possible playback.
+    for (int i = 0; i < MAX_NR_PASSES; ++i)
     {
-        g_nr_max_passes = 2;
-        if (CreateNRFeature(w, h, &g_params_c, &g_feature_c, "C"))
-            g_nr_max_passes = 3;
-        else
-            Log("NR feature C creation failed; limiting multipass to 2x");
-    }
-    else
-    {
-        Log("NR feature B creation failed; limiting multipass to 1x");
+        if (i > 0 && !g_multipass_enabled) break;
+        char label[2] = { (char)('A' + i), 0 };
+        NVSDK_NGX_Parameter *params = nullptr;
+        NVSDK_NGX_Handle *feature = nullptr;
+        if (!CreateNRFeature(w, h, &params, &feature, label))
+        {
+            if (i == 0) return false; // A is mandatory
+            Log("NR feature %s creation failed; limiting multipass to %dx", label, g_nr_max_passes);
+            break;
+        }
+        g_nr_params.push_back(params);
+        g_nr_features.push_back(feature);
+        g_nr_max_passes = i + 1;
     }
     Log("DLSS 5 multipass available: %d pass%s", g_nr_max_passes, g_nr_max_passes == 1 ? "" : "es");
     ExecuteAndWait();
@@ -583,14 +589,16 @@ static bool SetupNGX(UINT w, UINT h)
 
 static void ReleaseNGXObjects()
 {
-    ReleaseNRFeature(g_feature_c, g_params_c);
-    ReleaseNRFeature(g_feature_b, g_params_b);
-    ReleaseNRFeature(g_feature_a, g_params_a);
+    for (int i = (int)g_nr_features.size() - 1; i >= 0; --i)
+        ReleaseNRFeature(g_nr_features[i], g_nr_params[i]);
+    g_nr_features.clear();
+    g_nr_params.clear();
 
     if (g_ngx_initialized && g_shutdown) g_shutdown();
     g_ngx_initialized = false;
     g_nr_max_passes = 1;
 }
+
 
 // ---------------------------------------------------------------------------
 // compute shaders + descriptor heap
@@ -722,17 +730,23 @@ static void UpdateModeTitle()
     std::wstring modelText = g_nr_available ? L"Model: " : L"Model: N/A";
     if (g_nr_available) modelText += StyleName();
     SetWindowTextW(g_model_button, modelText.c_str());
-    if (g_nr_available) {
-        wchar_t passesText[32];
-        swprintf_s(passesText, L"Passes: %dx", g_nr_passes);
-        SetWindowTextW(g_passes_button, passesText);
-    } else {
-        SetWindowTextW(g_passes_button, L"Passes: N/A");
+    SendMessageW(g_multipass_checkbox, BM_SETCHECK, g_multipass_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    wchar_t passesText[48];
+    if (g_nr_available)
+        swprintf_s(passesText, L"Passes: %d / %d", g_nr_passes, g_nr_max_passes);
+    else
+        swprintf_s(passesText, L"Passes: N/A");
+    SetWindowTextW(g_passes_label, passesText);
+    if (g_passes_slider)
+    {
+        SendMessageW(g_passes_slider, TBM_SETRANGE, TRUE, MAKELPARAM(1, std::max(1, g_nr_max_passes)));
+        SendMessageW(g_passes_slider, TBM_SETPOS, TRUE, g_nr_passes);
     }
     EnableWindow(g_split_button, g_nr_available);
     EnableWindow(g_dlss_button, g_nr_available && !g_side);
     EnableWindow(g_model_button, g_nr_available);
-    EnableWindow(g_passes_button, g_nr_available);
+    EnableWindow(g_multipass_checkbox, g_nr_available);
+    EnableWindow(g_passes_slider, g_nr_available && g_multipass_enabled && g_nr_max_passes > 1);
     EnableWindow(g_pause_button, g_media_loaded);
     EnableWindow(g_prev_frame_button, g_media_loaded);
     EnableWindow(g_next_frame_button, g_media_loaded);
@@ -782,17 +796,54 @@ static void CycleModel()
     Log("DLSS 5 model: %s", g_style.c_str());
 }
 
+static void SetPasses(int passes)
+{
+    if (!g_nr_available) return;
+    passes = std::max(1, std::min(g_nr_max_passes, passes));
+    if (passes == g_nr_passes) return;
+    g_nr_passes = passes;
+    g_nr_reset = true;
+    g_refresh_view = true;
+    UpdateModeTitle();
+    Log("DLSS NR passes: %d", g_nr_passes);
+}
+
 static void CyclePasses()
 {
     if (!g_nr_available) return;
     int next = g_nr_passes + 1;
     if (next > g_nr_max_passes) next = 1;
-    g_nr_passes = next;
-    g_nr_reset = true;
-    g_refresh_view = true;
+    SetPasses(next);
+}
+
+// Rebuilds the NGX feature set for the new multipass on/off state. When turning
+// multipass off this drops back to a single feature-18 instance (the original,
+// fastest-playback configuration); turning it on re-probes up to MAX_NR_PASSES.
+static void ToggleMultipass()
+{
+    bool enabled = g_multipass_checkbox && SendMessageW(g_multipass_checkbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (enabled == g_multipass_enabled) return;
+    g_multipass_enabled = enabled;
+    Log("multipass: %s", g_multipass_enabled ? "ON" : "OFF");
+
+    if (g_nr_available && g_media_loaded)
+    {
+        for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i) WaitFence(g_fence[i].Get(), g_fence_value[i]);
+        ReleaseNGXObjects();
+        g_cmd_alloc[0]->Reset();
+        g_list->Reset(g_cmd_alloc[0].Get(), nullptr);
+        if (!SetupNGX(g_vid_w, g_vid_h))
+        {
+            g_list->Close();
+            g_nr_available = false;
+            g_nr_enabled = false;
+            g_side = false;
+            Log("NGX setup failed after multipass toggle; DLSS 5 NR disabled");
+        }
+        g_nr_reset = true;
+        g_refresh_view = true;
+    }
     UpdateModeTitle();
-    Log("DLSS NR passes: %d%s", g_nr_passes,
-        g_nr_passes == 1 ? "" : (g_nr_passes == 2 ? " (B -> A)" : " (B -> C -> A)"));
 }
 
 // Caller holds g_audio_lock so changing volume cannot race device replacement.
@@ -917,7 +968,7 @@ static void LayoutControls(HWND hwnd)
     struct Control { HWND window; int width; };
     Control buttons[] = {{g_pause_button, 72}, {g_prev_frame_button, 64},
         {g_next_frame_button, 64}, {g_split_button, 90}, {g_dlss_button, 100},
-        {g_model_button, 130}, {g_passes_button, 100}};
+        {g_model_button, 130}, {g_multipass_checkbox, 110}};
     const int NUM_BUTTONS = 7;
     int x = 6, row = 0;
     auto place = [&](int controlWidth) {
@@ -928,6 +979,7 @@ static void LayoutControls(HWND hwnd)
     };
     POINT positions[NUM_BUTTONS];
     for (int i = 0; i < NUM_BUTTONS; ++i) positions[i] = place(buttons[i].width);
+    POINT passes = place(240);
     POINT audio = place(280);
     int seekY = (row + 1) * 36 + 6;
     int videoHeight = std::max(1, height - (seekY + 34));
@@ -935,6 +987,8 @@ static void LayoutControls(HWND hwnd)
     for (int i = 0; i < NUM_BUTTONS; ++i)
         if (buttons[i].window) MoveWindow(buttons[i].window, positions[i].x,
             videoHeight + positions[i].y, buttons[i].width, 28, TRUE);
+    if (g_passes_label) MoveWindow(g_passes_label, passes.x, videoHeight + passes.y + 6, 100, 22, TRUE);
+    if (g_passes_slider) MoveWindow(g_passes_slider, passes.x + 106, videoHeight + passes.y, 130, 28, TRUE);
     if (g_mute_button) MoveWindow(g_mute_button, audio.x, videoHeight + audio.y, 70, 28, TRUE);
     if (g_volume_label) MoveWindow(g_volume_label, audio.x + 76, videoHeight + audio.y + 6, 88, 22, TRUE);
     if (g_volume_slider) MoveWindow(g_volume_slider, audio.x + 164, videoHeight + audio.y, 116, 28, TRUE);
@@ -973,7 +1027,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if ((HWND)lp == g_split_button && HIWORD(wp) == BN_CLICKED) { ToggleComparison(); return 0; }
         if ((HWND)lp == g_dlss_button && HIWORD(wp) == BN_CLICKED) { ToggleNR(); return 0; }
         if ((HWND)lp == g_model_button && HIWORD(wp) == BN_CLICKED) { CycleModel(); return 0; }
-        if ((HWND)lp == g_passes_button && HIWORD(wp) == BN_CLICKED) { CyclePasses(); return 0; }
+        if ((HWND)lp == g_multipass_checkbox && HIWORD(wp) == BN_CLICKED) { ToggleMultipass(); return 0; }
         if ((HWND)lp == g_mute_button && HIWORD(wp) == BN_CLICKED) { ToggleMute(); return 0; }
         break;
     case WM_KEYDOWN: if (wp == VK_ESCAPE) { g_running = false; } return 0;
@@ -989,6 +1043,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
     case WM_HSCROLL:
         if ((HWND)lp == g_volume_slider) {
             SetVolume((int)SendMessageW(g_volume_slider, TBM_GETPOS, 0, 0));
+            return 0;
+        }
+        if ((HWND)lp == g_passes_slider) {
+            SetPasses((int)SendMessageW(g_passes_slider, TBM_GETPOS, 0, 0));
             return 0;
         }
         if ((HWND)lp == g_trackbar)
@@ -1054,8 +1112,15 @@ static bool SetupWindow(UINT w, UINT h)
                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_model_button = CreateWindowExW(0, L"BUTTON", L"Model: Natural", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                     0, 0, 130, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_passes_button = CreateWindowExW(0, L"BUTTON", L"Passes: 1x", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_multipass_checkbox = CreateWindowExW(0, L"BUTTON", L"Multipass", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                          0, 0, 110, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    SendMessageW(g_multipass_checkbox, BM_SETCHECK, g_multipass_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    g_passes_label = CreateWindowExW(0, L"STATIC", L"Passes: 1 / 1", WS_CHILD | WS_VISIBLE,
+                                    0, 0, 100, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_passes_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Passes", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
+                                     0, 0, 130, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    SendMessageW(g_passes_slider, TBM_SETRANGE, TRUE, MAKELPARAM(1, MAX_NR_PASSES));
+    SendMessageW(g_passes_slider, TBM_SETPOS, TRUE, g_nr_passes);
     g_mute_button = CreateWindowExW(0, L"BUTTON", L"Mute", toggleStyle,
                                    0, 0, 70, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_volume_label = CreateWindowExW(0, L"STATIC", L"Volume: 100%", WS_CHILD | WS_VISIBLE,
@@ -1071,7 +1136,8 @@ static bool SetupWindow(UINT w, UINT h)
                                  0, h, dw, TBH, g_hwnd, nullptr, wc.hInstance, nullptr);
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
     if (!g_video_hwnd || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
-        !g_split_button || !g_dlss_button || !g_model_button || !g_passes_button || !g_trackbar ||
+        !g_split_button || !g_dlss_button || !g_model_button || !g_multipass_checkbox ||
+        !g_passes_label || !g_passes_slider || !g_trackbar ||
         !g_mute_button || !g_volume_label || !g_volume_slider) return false;
     if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) return false;
     LayoutControls(g_hwnd);
@@ -1426,37 +1492,40 @@ static void RenderFrame(const uint8_t *nv12)
     bool useNR = g_nr_available && (g_side || g_nr_enabled);
     if (useNR) {
         bool reset = (g_frame_index == 0 || g_nr_reset);
-        int passes = g_nr_passes;
 
-        if (passes <= 1)
+        if (!g_multipass_enabled)
         {
-            EvaluateNRStage(g_params_a, g_feature_a, g_nr_in.Get(), g_nr_out.Get(), reset, "A");
-        }
-        else if (passes == 2)
-        {
-            EvaluateNRStage(g_params_b, g_feature_b, g_nr_in.Get(), g_nr_mid1.Get(), reset, "B");
-            D3D12_RESOURCE_BARRIER mb = Trans(g_nr_mid1.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            g_list->ResourceBarrier(1, &mb);
-            EvaluateNRStage(g_params_a, g_feature_a, g_nr_mid1.Get(), g_nr_out.Get(), reset, "A");
-            D3D12_RESOURCE_BARRIER rb = Trans(g_nr_mid1.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            g_list->ResourceBarrier(1, &rb);
+            // Original single-pass path: one feature, no mid-texture barriers, fastest playback.
+            EvaluateNRStage(g_nr_params[0], g_nr_features[0], g_nr_in.Get(), g_nr_out.Get(), reset, "A");
+            g_nr_reset = false;
         }
         else
         {
-            EvaluateNRStage(g_params_b, g_feature_b, g_nr_in.Get(), g_nr_mid1.Get(), reset, "B");
-            D3D12_RESOURCE_BARRIER mb1 = Trans(g_nr_mid1.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            g_list->ResourceBarrier(1, &mb1);
-            EvaluateNRStage(g_params_c, g_feature_c, g_nr_mid1.Get(), g_nr_mid2.Get(), reset, "C");
-            D3D12_RESOURCE_BARRIER mb2 = Trans(g_nr_mid2.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            g_list->ResourceBarrier(1, &mb2);
-            EvaluateNRStage(g_params_a, g_feature_a, g_nr_mid2.Get(), g_nr_out.Get(), reset, "A");
-            D3D12_RESOURCE_BARRIER rbs[2] = {
-                Trans(g_nr_mid1.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-                Trans(g_nr_mid2.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-            };
-            g_list->ResourceBarrier(2, rbs);
+            int passes = std::max(1, std::min(g_nr_passes, (int)g_nr_features.size()));
+
+            // Cascade order: stage[passes-1] (deepest) -> ... -> stage[1] -> stage[0] ("A", final).
+            // stage[k]'s input is g_nr_in only for the deepest stage, else g_nr_mid[k];
+            // its output is g_nr_out only for stage 0, else g_nr_mid[k-1].
+            for (int k = passes - 1; k >= 0; --k)
+            {
+                ID3D12Resource *color = (k == passes - 1) ? g_nr_in.Get() : g_nr_mid[k].Get();
+                ID3D12Resource *output = (k == 0) ? g_nr_out.Get() : g_nr_mid[k - 1].Get();
+                char label[2] = { (char)('A' + k), 0 };
+                EvaluateNRStage(g_nr_params[k], g_nr_features[k], color, output, reset, label);
+                if (output != g_nr_out.Get())
+                {
+                    D3D12_RESOURCE_BARRIER b = Trans(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    g_list->ResourceBarrier(1, &b);
+                }
+            }
+            // restore intermediates used this frame to UAV, ready for the next frame's writes
+            for (int i = 0; i < passes - 1; ++i)
+            {
+                D3D12_RESOURCE_BARRIER b = Trans(g_nr_mid[i].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                g_list->ResourceBarrier(1, &b);
+            }
+            g_nr_reset = false;
         }
-        g_nr_reset = false;
     }
 
     // nr_out: UAV -> NPSR (cs2 reads); stage/orig: COMMON -> UAV (cs2 writes)
@@ -1617,10 +1686,10 @@ static int PlayVideo(const std::wstring &input)
                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     g_nr_out  = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    g_nr_mid1 = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    g_nr_mid2 = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    g_nr_mid.clear();
+    for (int i = 0; i < MAX_NR_PASSES - 1; ++i)
+        g_nr_mid.push_back(MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
     g_stage_rgba = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     g_orig_rgba  = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
@@ -1725,7 +1794,7 @@ static int PlayVideo(const std::wstring &input)
                 if (!(msg.lParam & (1LL << 30))) TogglePause();
                 continue;
             }
-            if (msg.message == WM_KEYDOWN && msg.hwnd != g_volume_slider && (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT))
+            if (msg.message == WM_KEYDOWN && msg.hwnd != g_volume_slider && msg.hwnd != g_passes_slider && (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT))
             {
                 if (!(msg.lParam & (1LL << 30))) RequestFrameStep(msg.wParam == VK_LEFT ? -1 : 1);
                 continue;
@@ -1851,7 +1920,7 @@ static void CleanupPlayback()
     g_swap.Reset(); g_readback.Reset();
     g_pso_in.Reset(); g_pso_out.Reset(); g_rs.Reset(); g_cbv_heap.Reset();
     g_y_tex.Reset(); g_uv_tex.Reset(); g_staging.Reset(); g_nr_in.Reset();
-    g_nr_out.Reset(); g_nr_mid1.Reset(); g_nr_mid2.Reset();
+    g_nr_out.Reset(); g_nr_mid.clear();
     g_stage_rgba.Reset(); g_orig_rgba.Reset(); g_list.Reset();
     for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i) {
         g_cmd_alloc[i].Reset(); g_fence[i].Reset(); g_fence_value[i] = 0;
@@ -1890,8 +1959,10 @@ int wmain(int argc, wchar_t **argv)
         else if (a == L"--passes" && i + 1 < argc)
         {
             int v = _wtoi(argv[++i]);
-            if (v < 1 || v > 3) { Log("invalid --passes value %d; must be 1, 2, or 3; using 1", v); v = 1; }
+            if (v < 1 || v > MAX_NR_PASSES)
+                { Log("invalid --passes value %d; must be 1..%d; using 1", v, MAX_NR_PASSES); v = 1; }
             g_nr_passes = v;
+            if (v > 1) g_multipass_enabled = true; // an explicit multi-pass request implies enabling it
         }
         else if (a == L"--fast") g_fast = true;
         else if (a == L"--nr-only") g_side = false;
@@ -1934,8 +2005,8 @@ int wmain(int argc, wchar_t **argv)
             if (message.wParam == 'D') { ToggleNR(); continue; }
             if (message.wParam == 'M') { CycleModel(); continue; }
             if (message.wParam == 'P') { CyclePasses(); continue; }
-            if (message.wParam == VK_LEFT && message.hwnd != g_volume_slider) { RequestFrameStep(-1); continue; }
-            if (message.wParam == VK_RIGHT && message.hwnd != g_volume_slider) { RequestFrameStep(1); continue; }
+            if (message.wParam == VK_LEFT && message.hwnd != g_volume_slider && message.hwnd != g_passes_slider) { RequestFrameStep(-1); continue; }
+            if (message.wParam == VK_RIGHT && message.hwnd != g_volume_slider && message.hwnd != g_passes_slider) { RequestFrameStep(1); continue; }
         }
         TranslateMessage(&message); DispatchMessageW(&message);
     }
