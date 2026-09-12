@@ -193,7 +193,7 @@ static ComPtr<IDXGISwapChain3> g_swap;
 static HWND g_hwnd = nullptr;
 static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
 static HWND g_split_button = nullptr, g_dlss_button = nullptr, g_model_button = nullptr;
-static HWND g_passes_slider = nullptr, g_passes_label = nullptr;
+static HWND g_passes_slider = nullptr, g_passes_label = nullptr, g_passes_edit = nullptr;
 static HWND g_multipass_checkbox = nullptr;
 static HWND g_prev_frame_button = nullptr, g_next_frame_button = nullptr;
 static HWND g_volume_slider = nullptr, g_volume_label = nullptr, g_mute_button = nullptr;
@@ -980,22 +980,17 @@ static void UpdateModeTitle()
     SetWindowTextW(g_model_button, modelText.c_str());
     SetWindowTextW(g_multipass_checkbox, !g_nr_available ? L"Multipass: N/A" : (g_multipass_enabled ? L"Multipass: ON" : L"Multipass: OFF"));
     SendMessageW(g_multipass_checkbox, BM_SETCHECK, g_multipass_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    wchar_t passesText[48];
-    if (g_nr_available)
-        swprintf_s(passesText, L"Passes: %d / %d", g_nr_passes, g_nr_max_passes);
-    else
-        swprintf_s(passesText, L"Passes: N/A");
-    SetWindowTextW(g_passes_label, passesText);
-    if (g_passes_slider)
-    {
-        SendMessageW(g_passes_slider, TBM_SETRANGE, TRUE, MAKELPARAM(1, std::max(1, g_nr_max_passes)));
-        SendMessageW(g_passes_slider, TBM_SETPOS, TRUE, g_nr_passes);
+    if (g_passes_edit) {
+        if (g_nr_available)
+            SetWindowTextW(g_passes_edit, std::to_wstring(g_nr_passes).c_str());
+        else
+            SetWindowTextW(g_passes_edit, L"1");
+        EnableWindow(g_passes_edit, g_nr_available && g_multipass_enabled && g_nr_max_passes > 1);
     }
     EnableWindow(g_split_button, g_nr_available);
     EnableWindow(g_dlss_button, g_nr_available && !g_side);
     EnableWindow(g_model_button, g_nr_available);
     EnableWindow(g_multipass_checkbox, g_nr_available);
-    EnableWindow(g_passes_slider, g_nr_available && g_multipass_enabled && g_nr_max_passes > 1);
     EnableWindow(g_pause_button, g_media_loaded);
     EnableWindow(g_prev_frame_button, g_media_loaded);
     EnableWindow(g_next_frame_button, g_media_loaded);
@@ -1057,6 +1052,16 @@ static void SetPasses(int passes)
     g_refresh_view = true;
     UpdateModeTitle();
     Log("DLSS NR passes: %d", g_nr_passes);
+}
+
+static void CommitPassesEdit()
+{
+    if (!g_passes_edit || !g_multipass_enabled || !g_nr_available) return;
+    wchar_t text[16] = {};
+    GetWindowTextW(g_passes_edit, text, 16);
+    int value = _wtoi(text);
+    if (value > 0) SetPasses(value);
+    else UpdateModeTitle();
 }
 
 static void CyclePasses()
@@ -1260,13 +1265,12 @@ static void LayoutControls(HWND hwnd)
 {
     const int muteWidth = 70, volumeLabelWidth = 110, volumeSliderWidth = 100;
     const int audioWidth = muteWidth + 6 + volumeLabelWidth + 6 + volumeSliderWidth;
-    const int passesLabelWidth = 100, passesSliderWidth = 130;
-    const int passesWidth = passesLabelWidth + 6 + passesSliderWidth;
+    const int passesEntryWidth = 60;
     RECT r; GetClientRect(hwnd, &r);
     int width = r.right, height = r.bottom;
     HWND chrome[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
-        g_split_button, g_dlss_button, g_model_button, g_multipass_checkbox, g_fullscreen_button,
-        g_passes_label, g_passes_slider, g_mute_button, g_volume_label, g_volume_slider, g_trackbar};
+        g_split_button, g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
+        g_fullscreen_button, g_mute_button, g_volume_label, g_volume_slider, g_trackbar};
     if (g_fullscreen) {
         for (HWND control : chrome) if (control) ShowWindow(control, SW_HIDE);
         UINT contentWidth = g_vid_w * (g_side ? 2u : 1u);
@@ -1281,8 +1285,8 @@ static void LayoutControls(HWND hwnd)
     struct Control { HWND window; int width; };
     Control buttons[] = {{g_pause_button, 72}, {g_prev_frame_button, 64},
         {g_next_frame_button, 64}, {g_split_button, 90}, {g_dlss_button, 100},
-        {g_model_button, 130}, {g_multipass_checkbox, 110}, {g_fullscreen_button, 88}};
-    const int NUM_BUTTONS = 8;
+        {g_model_button, 130}, {g_fullscreen_button, 88}};
+    const int NUM_BUTTONS = 7;
     int x = 8, row = 0;
     auto place = [&](int controlWidth) {
         if (x > 8 && x + controlWidth > width - 8) { x = 8; ++row; }
@@ -1292,8 +1296,11 @@ static void LayoutControls(HWND hwnd)
     };
     POINT positions[NUM_BUTTONS];
     for (int i = 0; i < NUM_BUTTONS; ++i) positions[i] = place(buttons[i].width);
-    POINT passes = place(passesWidth);
-    POINT audio = place(audioWidth);
+    POINT multipass = place(110);
+    POINT passes = place(passesEntryWidth);
+    POINT audio = {std::max(8, width - audioWidth - 8), passes.y};
+    if (audio.x < passes.x + passesEntryWidth + 12) audio.x = passes.x + passesEntryWidth + 12;
+    if (audio.x + audioWidth > width - 8) audio.x = std::max(8, width - audioWidth - 8);
     int seekY = (row + 1) * 42 + 8;
     int videoHeight = std::max(1, height - (seekY + 38));
     UINT contentWidth = g_media_loaded ? g_vid_w * (g_side ? 2u : 1u) : 0;
@@ -1307,9 +1314,10 @@ static void LayoutControls(HWND hwnd)
     for (int i = 0; i < NUM_BUTTONS; ++i)
         placements[count++] = {buttons[i].window, positions[i].x,
             videoHeight + positions[i].y, buttons[i].width, 34};
-    placements[count++] = {g_passes_label, passes.x, videoHeight + passes.y + 6, passesLabelWidth, 22};
-    placements[count++] = {g_passes_slider, passes.x + passesLabelWidth + 6,
-        videoHeight + passes.y, passesSliderWidth, 34};
+    placements[count++] = {g_multipass_checkbox, multipass.x,
+        videoHeight + multipass.y, 110, 34};
+    placements[count++] = {g_passes_edit, passes.x,
+        videoHeight + passes.y, passesEntryWidth, 28};
     placements[count++] = {g_mute_button, audio.x, videoHeight + audio.y, muteWidth, 34};
     placements[count++] = {g_volume_label, audio.x + muteWidth + 6,
         videoHeight + audio.y + 6, volumeLabelWidth, 22};
@@ -1329,7 +1337,6 @@ static void LayoutControls(HWND hwnd)
             SetWindowPos(placements[i].window, nullptr,
                 placements[i].x, placements[i].y, placements[i].width, placements[i].height,
                 SWP_NOZORDER | SWP_NOACTIVATE);
-
     RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
@@ -1457,6 +1464,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if ((HWND)lp == g_dlss_button && HIWORD(wp) == BN_CLICKED) { ToggleNR(); return 0; }
         if ((HWND)lp == g_model_button && HIWORD(wp) == BN_CLICKED) { CycleModel(); return 0; }
         if ((HWND)lp == g_multipass_checkbox && HIWORD(wp) == BN_CLICKED) { ToggleMultipass(); return 0; }
+        if ((HWND)lp == g_passes_edit &&
+            (HIWORD(wp) == EN_CHANGE || HIWORD(wp) == EN_KILLFOCUS)) return 0;
         if ((HWND)lp == g_mute_button && HIWORD(wp) == BN_CLICKED) { ToggleMute(); return 0; }
         if ((HWND)lp == g_video_hwnd && HIWORD(wp) == STN_CLICKED) { TogglePause(); return 0; }
         if ((HWND)lp == g_fullscreen_button && HIWORD(wp) == BN_CLICKED) { ToggleFullscreen(); return 0; }
@@ -1480,10 +1489,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
     case WM_HSCROLL:
         if ((HWND)lp == g_volume_slider) {
             SetVolume((int)SendMessageW(g_volume_slider, TBM_GETPOS, 0, 0));
-            return 0;
-        }
-        if ((HWND)lp == g_passes_slider) {
-            SetPasses((int)SendMessageW(g_passes_slider, TBM_GETPOS, 0, 0));
             return 0;
         }
         if ((HWND)lp == g_trackbar)
@@ -1571,12 +1576,8 @@ static bool SetupWindow(UINT w, UINT h)
                                     0, 0, 130, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_multipass_checkbox = CreateWindowExW(0, L"BUTTON", L"Multipass: OFF", toggleStyle,
                                           0, 0, 110, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_passes_label = CreateWindowExW(0, L"STATIC", L"Passes: 1 / 1", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                    0, 0, 100, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_passes_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Passes", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
-                                     0, 0, 130, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    SendMessageW(g_passes_slider, TBM_SETRANGE, TRUE, MAKELPARAM(1, MAX_NR_PASSES));
-    SendMessageW(g_passes_slider, TBM_SETPOS, TRUE, g_nr_passes);
+    g_passes_edit = CreateWindowExW(0, L"EDIT", L"1", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_CENTER,
+                                   0, 0, 60, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_fullscreen_button = CreateWindowExW(0, L"BUTTON", L"Full screen", buttonStyle,
                                          0, 0, 88, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_mute_button = CreateWindowExW(0, L"BUTTON", L"Mute", toggleStyle,
@@ -1592,19 +1593,28 @@ static bool SetupWindow(UINT w, UINT h)
     // seek bar (child trackbar at the bottom)
     g_trackbar = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
                                  0, h, dw, TBH, g_hwnd, nullptr, wc.hInstance, nullptr);
+
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
     if (!g_video_hwnd || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
         !g_split_button || !g_dlss_button || !g_model_button || !g_multipass_checkbox ||
-        !g_passes_label || !g_passes_slider || !g_trackbar ||
-        !g_mute_button || !g_volume_label || !g_volume_slider || !g_fullscreen_button) return false;
+        !g_passes_edit || !g_trackbar ||
+        !g_mute_button || !g_volume_label || !g_volume_slider || !g_fullscreen_button) {
+        return false;
+    }
     HWND controls[] = {g_video_hwnd, g_pause_button, g_prev_frame_button, g_next_frame_button,
-        g_split_button, g_dlss_button, g_model_button, g_multipass_checkbox, g_fullscreen_button,
-        g_passes_label, g_passes_slider, g_mute_button, g_volume_label, g_volume_slider, g_trackbar};
+        g_split_button, g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
+        g_fullscreen_button, g_mute_button, g_volume_label, g_volume_slider, g_trackbar};
     for (HWND control : controls) SendMessageW(control, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
     HWND buttons[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
         g_split_button, g_dlss_button, g_model_button, g_multipass_checkbox, g_fullscreen_button, g_mute_button};
-    for (HWND button : buttons) if (!SetWindowSubclass(button, ModernButtonProc, 2, 0)) return false;
-    if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) return false;
+    for (HWND button : buttons) {
+        if (!SetWindowSubclass(button, ModernButtonProc, 2, 0)) {
+            return false;
+        }
+    }
+    if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) {
+        return false;
+    }
     ApplyTheme(true);
     LayoutControls(g_hwnd);
     }
@@ -2244,6 +2254,11 @@ static int PlayVideo(const std::wstring &input)
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
         {
             if (msg.message == WM_QUIT) { g_running = false; break; }
+            if (msg.message == WM_KEYDOWN && msg.hwnd == g_passes_edit && msg.wParam == VK_RETURN)
+            {
+                CommitPassesEdit();
+                continue;
+            }
             if (msg.message == WM_KEYDOWN && msg.wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) { OpenVideoDialog(g_hwnd); continue; }
             if (msg.message == WM_KEYDOWN && (msg.wParam == 'S' || msg.wParam == 'D' || msg.wParam == 'M' || msg.wParam == 'P'))
             {
@@ -2260,7 +2275,7 @@ static int PlayVideo(const std::wstring &input)
                 if (!(msg.lParam & (1LL << 30))) TogglePause();
                 continue;
             }
-            if (msg.message == WM_KEYDOWN && msg.hwnd != g_volume_slider && msg.hwnd != g_passes_slider && (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT))
+            if (msg.message == WM_KEYDOWN && msg.hwnd != g_volume_slider && msg.hwnd != g_passes_edit && (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT))
             {
                 if (!(msg.lParam & (1LL << 30))) RequestFrameStep(msg.wParam == VK_LEFT ? -1 : 1);
                 continue;
@@ -2451,12 +2466,17 @@ int wmain(int argc, wchar_t **argv)
     if (input.empty()) g_gui = true;
     if (!g_output.empty() && g_fast) { Log("note: offline mode (--output) already runs full speed"); }
 
-    // common controls (trackbar)
-    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES };
+    // common controls (trackbar + standard edit/button/static controls)
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
 
-
-    if (g_gui && !SetupWindow(960, 540)) return 1;
+    g_running = true;
+    if (g_gui) {
+        if (!SetupWindow(960, 540)) {
+            MessageBoxW(nullptr, L"Window setup failed; the player could not initialize its controls.", L"DLSS 5 NR Player", MB_OK | MB_ICONERROR);
+            return 1;
+        }
+    }
     int result = 0;
     while (g_running) {
         if (!input.empty()) {
@@ -2474,6 +2494,11 @@ int wmain(int argc, wchar_t **argv)
         MSG message;
         int got = GetMessageW(&message, nullptr, 0, 0);
         if (got <= 0) break;
+        if (message.message == WM_KEYDOWN && message.hwnd == g_passes_edit && message.wParam == VK_RETURN)
+        {
+            CommitPassesEdit();
+            continue;
+        }
         if (message.message == WM_KEYDOWN) {
             if (message.wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) { OpenVideoDialog(g_hwnd); continue; }
             if (message.wParam == 'S') { ToggleComparison(); continue; }
@@ -2481,8 +2506,8 @@ int wmain(int argc, wchar_t **argv)
             if (message.wParam == 'M') { CycleModel(); continue; }
             if (message.wParam == 'P') { CyclePasses(); continue; }
             if (message.wParam == VK_F11) { ToggleFullscreen(); continue; }
-            if (message.wParam == VK_LEFT && message.hwnd != g_volume_slider && message.hwnd != g_passes_slider) { RequestFrameStep(-1); continue; }
-            if (message.wParam == VK_RIGHT && message.hwnd != g_volume_slider && message.hwnd != g_passes_slider) { RequestFrameStep(1); continue; }
+            if (message.wParam == VK_LEFT && message.hwnd != g_volume_slider && message.hwnd != g_passes_edit) { RequestFrameStep(-1); continue; }
+            if (message.wParam == VK_RIGHT && message.hwnd != g_volume_slider && message.hwnd != g_passes_edit) { RequestFrameStep(1); continue; }
             if (message.wParam == VK_ESCAPE && g_fullscreen) { ToggleFullscreen(); continue; }
         }
         TranslateMessage(&message); DispatchMessageW(&message);
