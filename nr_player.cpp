@@ -1318,11 +1318,12 @@ static void LayoutControls(HWND hwnd)
         videoHeight + multipass.y, 110, 34};
     placements[count++] = {g_passes_edit, passes.x,
         videoHeight + passes.y, passesEntryWidth, 28};
-    placements[count++] = {g_mute_button, audio.x, videoHeight + audio.y, muteWidth, 34};
-    placements[count++] = {g_volume_label, audio.x + muteWidth + 6,
+    placements[count++] = {g_volume_label, audio.x,
         videoHeight + audio.y + 6, volumeLabelWidth, 22};
-    placements[count++] = {g_volume_slider, audio.x + muteWidth + 6 + volumeLabelWidth + 6,
+    placements[count++] = {g_volume_slider, audio.x + volumeLabelWidth + 6,
         videoHeight + audio.y, volumeSliderWidth, 34};
+    placements[count++] = {g_mute_button, audio.x + volumeLabelWidth + 6 + volumeSliderWidth + 6,
+        videoHeight + audio.y, muteWidth, 34};
     placements[count++] = {g_trackbar, 8, videoHeight + seekY, std::max(1, width - 16), 30};
 
     HDWP batch = BeginDeferWindowPos(count);
