@@ -848,8 +848,16 @@ static void DrawModernButton(const DRAWITEMSTRUCT *draw)
     bool pressed = draw->itemState & ODS_SELECTED;
     bool active = IsButtonActive(draw->hwndItem);
     bool hovered = draw->hwndItem == g_hover_button;
+    bool modelButton = draw->hwndItem == g_model_button;
+    int modelStyle = StyleValue();
+    bool modelEnabled = g_nr_available && (g_nr_enabled || g_side);
+
     COLORREF fill = active ? (hovered ? colors.accentHover : colors.accent) :
         (hovered ? colors.buttonHover : colors.button);
+    if (modelButton && modelEnabled) {
+        if (modelStyle == 1) fill = RGB(30, 160, 90);
+        else if (modelStyle == 2) fill = RGB(220, 93, 170);
+    }
     if (pressed) fill = active ? colors.accentHover : colors.border;
 
     HBRUSH background = CreateSolidBrush(colors.background);
@@ -870,6 +878,10 @@ static void DrawModernButton(const DRAWITEMSTRUCT *draw)
 
     SetBkMode(draw->hDC, TRANSPARENT);
     COLORREF iconColor = enabled ? (active ? RGB(255, 255, 255) : colors.text) : colors.mutedText;
+    if (modelButton && modelEnabled) {
+        if (modelStyle == 1) iconColor = RGB(220, 255, 230);
+        else if (modelStyle == 2) iconColor = RGB(255, 230, 245);
+    }
     if (!DrawButtonImage(draw, pressed)) {
         wchar_t text[128] = {};
         GetWindowTextW(draw->hwndItem, text, 128);
