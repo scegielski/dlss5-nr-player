@@ -16,10 +16,12 @@ def main():
     if missing:
         parser.error('Missing local dependencies: ' + ', '.join(missing) + '. See README.md.')
     ffi_candidates = [Path(sys.prefix) / 'Library' / 'bin' / 'ffi.dll',
-                      Path(sys.prefix) / 'ffi.dll']
+                      Path(sys.prefix) / 'ffi.dll',
+                      Path(sys.prefix) / 'DLLs' / 'libffi-8.dll',
+                      Path(sys.base_prefix) / 'DLLs' / 'libffi-8.dll']
     ffi_dll = next((path for path in ffi_candidates if path.is_file()), None)
     if ffi_dll is None:
-        parser.error('Could not find ffi.dll required by Python ctypes. '
+        parser.error('Could not find ffi.dll or libffi-8.dll required by Python ctypes. '
                      'Install libffi in the active Python environment.')
     try:
         from PyInstaller.__main__ import run
