@@ -15,6 +15,8 @@
 #define NVSDK_CONV __cdecl
 #endif
 #include <windows.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <mmsystem.h>
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -37,6 +39,12 @@
 #include "nr_runtime.h"
 
 using Microsoft::WRL::ComPtr;
+using namespace Gdiplus;
+
+static ULONG_PTR g_gdiplus_token = 0;
+static Image *g_pause_icon = nullptr, *g_frame_back_icon = nullptr,
+             *g_frame_forward_icon = nullptr, *g_mute_icon = nullptr,
+             *g_volume_icon = nullptr;
 
 // forward-declared (we never touch D3D11; only the NGX vtable signature needs it)
 struct ID3D11Resource;
@@ -770,6 +778,65 @@ static bool IsButtonActive(HWND button)
         (button == g_mute_button && g_muted);
 }
 
+static Image *LoadIconAsset(const wchar_t *name)
+{
+    wchar_t modulePath[MAX_PATH] = {};
+    DWORD length = GetModuleFileNameW(nullptr, modulePath, ARRAYSIZE(modulePath));
+    if (!length || length >= ARRAYSIZE(modulePath)) return nullptr;
+    std::wstring path(modulePath, length);
+    size_t slash = path.find_last_of(L"\\/");
+    path.resize(slash == std::wstring::npos ? 0 : slash + 1);
+    path += name;
+    Image *image = Image::FromFile(path.c_str(), FALSE);
+    if (!image || image->GetLastStatus() != Ok) {
+        delete image;
+        return nullptr;
+    }
+    return image;
+}
+
+static void LoadIconAssets()
+{
+    g_pause_icon = LoadIconAsset(L"pause.png");
+    g_frame_back_icon = LoadIconAsset(L"frame_back.png");
+    g_frame_forward_icon = LoadIconAsset(L"frame_forward.png");
+    g_mute_icon = LoadIconAsset(L"mute.png");
+    g_volume_icon = LoadIconAsset(L"volume.png");
+}
+
+static void ReleaseIconAssets()
+{
+    delete g_pause_icon; g_pause_icon = nullptr;
+    delete g_frame_back_icon; g_frame_back_icon = nullptr;
+    delete g_frame_forward_icon; g_frame_forward_icon = nullptr;
+    delete g_mute_icon; g_mute_icon = nullptr;
+    delete g_volume_icon; g_volume_icon = nullptr;
+    if (g_gdiplus_token) {
+        GdiplusShutdown(g_gdiplus_token);
+        g_gdiplus_token = 0;
+    }
+}
+
+static bool DrawButtonImage(const DRAWITEMSTRUCT *draw, bool pressed)
+{
+    Image *image = nullptr;
+    if (draw->hwndItem == g_pause_button) image = g_pause_icon;
+    else if (draw->hwndItem == g_prev_frame_button) image = g_frame_back_icon;
+    else if (draw->hwndItem == g_next_frame_button) image = g_frame_forward_icon;
+    else if (draw->hwndItem == g_mute_button) image = g_muted ? g_mute_icon : g_volume_icon;
+    if (!image) return false;
+
+    Graphics graphics(draw->hDC);
+    graphics.SetCompositingMode(CompositingModeSourceOver);
+    graphics.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    graphics.SetPixelOffsetMode(PixelOffsetModeHighQuality);
+    const int size = 30;
+    int x = (draw->rcItem.left + draw->rcItem.right - size) / 2;
+    int y = (draw->rcItem.top + draw->rcItem.bottom - size) / 2 + (pressed ? 1 : 0);
+    graphics.DrawImage(image, Rect(x, y, size, size));
+    return true;
+}
+
 static void DrawModernButton(const DRAWITEMSTRUCT *draw)
 {
     ThemeColors colors = CurrentThemeColors();
@@ -797,16 +864,19 @@ static void DrawModernButton(const DRAWITEMSTRUCT *draw)
     DeleteObject(borderPen);
     DeleteObject(faceBrush);
 
-    wchar_t text[128] = {};
-    GetWindowTextW(draw->hwndItem, text, 128);
     SetBkMode(draw->hDC, TRANSPARENT);
-    SetTextColor(draw->hDC, enabled ? (active ? RGB(255, 255, 255) : colors.text) : colors.mutedText);
-    HFONT font = (HFONT)SendMessageW(draw->hwndItem, WM_GETFONT, 0, 0);
-    HGDIOBJ oldFont = font ? SelectObject(draw->hDC, font) : nullptr;
-    RECT label = face;
-    if (pressed) OffsetRect(&label, 0, 1);
-    DrawTextW(draw->hDC, text, -1, &label, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    if (oldFont) SelectObject(draw->hDC, oldFont);
+    COLORREF iconColor = enabled ? (active ? RGB(255, 255, 255) : colors.text) : colors.mutedText;
+    if (!DrawButtonImage(draw, pressed)) {
+        wchar_t text[128] = {};
+        GetWindowTextW(draw->hwndItem, text, 128);
+        SetTextColor(draw->hDC, iconColor);
+        HFONT font = (HFONT)SendMessageW(draw->hwndItem, WM_GETFONT, 0, 0);
+        HGDIOBJ oldFont = font ? SelectObject(draw->hDC, font) : nullptr;
+        RECT label = face;
+        if (pressed) OffsetRect(&label, 0, 1);
+        DrawTextW(draw->hDC, text, -1, &label, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (oldFont) SelectObject(draw->hDC, oldFont);
+    }
 
     if ((draw->itemState & ODS_FOCUS) && enabled) {
         RECT focus = face;
@@ -2471,10 +2541,17 @@ int wmain(int argc, wchar_t **argv)
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
 
+    if (g_gui) {
+        GdiplusStartupInput gdiplusInput;
+        if (GdiplusStartup(&g_gdiplus_token, &gdiplusInput, nullptr) == Ok)
+            LoadIconAssets();
+    }
+
     g_running = true;
     if (g_gui) {
         if (!SetupWindow(960, 540)) {
             MessageBoxW(nullptr, L"Window setup failed; the player could not initialize its controls.", L"DLSS 5 NR Player", MB_OK | MB_ICONERROR);
+            ReleaseIconAssets();
             return 1;
         }
     }
@@ -2513,5 +2590,6 @@ int wmain(int argc, wchar_t **argv)
         }
         TranslateMessage(&message); DispatchMessageW(&message);
     }
+    ReleaseIconAssets();
     return result;
 }

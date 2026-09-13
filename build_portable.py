@@ -9,7 +9,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dist-dir', type=Path, default=project / 'dist')
     options = parser.parse_args()
-    files = ['nr_player.exe', 'ffmpeg.exe', 'ffprobe.exe', '_nvngx.dll',
+    files = ['nr_player.exe', 'pause.png', 'frame_back.png', 'frame_forward.png', 'mute.png', 'volume.png',
+             'ffmpeg.exe', 'ffprobe.exe', '_nvngx.dll',
              'nvngx_dlssnr.dll', 'caller/nvngx.dll', 'runtime40/nvngx_dlssnr.dll']
     missing = [name for name in files if not (project / name).is_file()]
     if missing:
