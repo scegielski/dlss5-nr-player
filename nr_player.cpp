@@ -44,7 +44,7 @@ using namespace Gdiplus;
 static ULONG_PTR g_gdiplus_token = 0;
 static Image *g_pause_icon = nullptr, *g_frame_back_icon = nullptr,
              *g_frame_forward_icon = nullptr, *g_mute_icon = nullptr,
-             *g_volume_icon = nullptr;
+             *g_volume_icon = nullptr, *g_fullscreen_icon = nullptr;
 
 // forward-declared (we never touch D3D11; only the NGX vtable signature needs it)
 struct ID3D11Resource;
@@ -802,6 +802,7 @@ static void LoadIconAssets()
     g_frame_forward_icon = LoadIconAsset(L"frame_forward.png");
     g_mute_icon = LoadIconAsset(L"mute.png");
     g_volume_icon = LoadIconAsset(L"volume.png");
+    g_fullscreen_icon = LoadIconAsset(L"full-screen.png");
 }
 
 static void ReleaseIconAssets()
@@ -811,6 +812,7 @@ static void ReleaseIconAssets()
     delete g_frame_forward_icon; g_frame_forward_icon = nullptr;
     delete g_mute_icon; g_mute_icon = nullptr;
     delete g_volume_icon; g_volume_icon = nullptr;
+    delete g_fullscreen_icon; g_fullscreen_icon = nullptr;
     if (g_gdiplus_token) {
         GdiplusShutdown(g_gdiplus_token);
         g_gdiplus_token = 0;
@@ -824,6 +826,7 @@ static bool DrawButtonImage(const DRAWITEMSTRUCT *draw, bool pressed)
     else if (draw->hwndItem == g_prev_frame_button) image = g_frame_back_icon;
     else if (draw->hwndItem == g_next_frame_button) image = g_frame_forward_icon;
     else if (draw->hwndItem == g_mute_button) image = g_muted ? g_mute_icon : g_volume_icon;
+    else if (draw->hwndItem == g_fullscreen_button) image = g_fullscreen_icon;
     if (!image) return false;
 
     Graphics graphics(draw->hDC);
@@ -1646,7 +1649,7 @@ static bool SetupWindow(UINT w, UINT h)
                                           0, 0, 110, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_passes_edit = CreateWindowExW(0, L"EDIT", L"1", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_CENTER,
                                    0, 0, 60, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_fullscreen_button = CreateWindowExW(0, L"BUTTON", L"Full screen", buttonStyle,
+    g_fullscreen_button = CreateWindowExW(0, L"BUTTON", L"", buttonStyle,
                                          0, 0, 88, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_mute_button = CreateWindowExW(0, L"BUTTON", L"Mute", toggleStyle,
                                    0, 0, 70, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
