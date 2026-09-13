@@ -204,7 +204,7 @@ static HWND g_split_button = nullptr, g_dlss_button = nullptr, g_model_button = 
 static HWND g_passes_slider = nullptr, g_passes_label = nullptr, g_passes_edit = nullptr;
 static HWND g_multipass_checkbox = nullptr;
 static HWND g_prev_frame_button = nullptr, g_next_frame_button = nullptr;
-static HWND g_volume_slider = nullptr, g_volume_label = nullptr, g_mute_button = nullptr;
+static HWND g_volume_slider = nullptr, g_mute_button = nullptr;
 static HWND g_fullscreen_button = nullptr;
 static bool g_gui = false, g_media_loaded = false;
 static std::wstring g_open_path;
@@ -1185,9 +1185,6 @@ static void ApplyVolumeLocked()
 
 static void UpdateVolumeControls()
 {
-    wchar_t label[32];
-    swprintf_s(label, L"Volume: %d%%", g_volume);
-    SetWindowTextW(g_volume_label, label);
     SetWindowTextW(g_mute_button, g_muted ? L"Unmute" : L"Mute");
     SendMessageW(g_mute_button, BM_SETCHECK, g_muted ? BST_CHECKED : BST_UNCHECKED, 0);
 }
@@ -1338,14 +1335,14 @@ static void ToggleFullscreen()
 
 static void LayoutControls(HWND hwnd)
 {
-    const int muteWidth = 70, volumeLabelWidth = 110, volumeSliderWidth = 100;
-    const int audioWidth = muteWidth + 6 + volumeLabelWidth + 6 + volumeSliderWidth;
+    const int muteWidth = 70, volumeSliderWidth = 100;
+    const int audioWidth = muteWidth + 6 + volumeSliderWidth;
     const int passesEntryWidth = 60;
     RECT r; GetClientRect(hwnd, &r);
     int width = r.right, height = r.bottom;
     HWND chrome[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
         g_split_button, g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
-        g_fullscreen_button, g_mute_button, g_volume_label, g_volume_slider, g_trackbar};
+        g_fullscreen_button, g_mute_button, g_volume_slider, g_trackbar};
     if (g_fullscreen) {
         for (HWND control : chrome) if (control) ShowWindow(control, SW_HIDE);
         UINT contentWidth = g_vid_w * (g_side ? 2u : 1u);
@@ -1382,12 +1379,9 @@ static void LayoutControls(HWND hwnd)
     placements[count++] = {g_next_frame_button, topX + 64 + 6 + 72 + 6,
         videoHeight + topRowY, 64, 34};
     placements[count++] = {g_trackbar, seekX, videoHeight + topRowY + 2, seekWidth, 30};
-    placements[count++] = {g_volume_label, audioX, videoHeight + topRowY + 6,
-        volumeLabelWidth, 22};
-    placements[count++] = {g_volume_slider, audioX + volumeLabelWidth + 6,
+    placements[count++] = {g_mute_button, audioX, videoHeight + topRowY, muteWidth, 34};
+    placements[count++] = {g_volume_slider, audioX + muteWidth + 6,
         videoHeight + topRowY, volumeSliderWidth, 34};
-    placements[count++] = {g_mute_button, audioX + volumeLabelWidth + 6 + volumeSliderWidth + 6,
-        videoHeight + topRowY, muteWidth, 34};
     placements[count++] = {g_fullscreen_button, fullscreenX, videoHeight + topRowY, fullscreenWidth, 34};
     placements[count++] = {g_dlss_button, bottomX, videoHeight + bottomRowY, 100, 34};
     placements[count++] = {g_model_button, bottomX + 100 + 6, videoHeight + bottomRowY, 130, 34};
@@ -1655,8 +1649,6 @@ static bool SetupWindow(UINT w, UINT h)
                                          0, 0, 88, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_mute_button = CreateWindowExW(0, L"BUTTON", L"Mute", toggleStyle,
                                    0, 0, 70, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_volume_label = CreateWindowExW(0, L"STATIC", L"Volume: 100%", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                    0, 0, 88, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_volume_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Volume", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
                                      0, 0, 116, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     SendMessageW(g_volume_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
@@ -1671,12 +1663,12 @@ static bool SetupWindow(UINT w, UINT h)
     if (!g_video_hwnd || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
         !g_split_button || !g_dlss_button || !g_model_button || !g_multipass_checkbox ||
         !g_passes_edit || !g_trackbar ||
-        !g_mute_button || !g_volume_label || !g_volume_slider || !g_fullscreen_button) {
+        !g_mute_button || !g_volume_slider || !g_fullscreen_button) {
         return false;
     }
     HWND controls[] = {g_video_hwnd, g_pause_button, g_prev_frame_button, g_next_frame_button,
         g_split_button, g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
-        g_fullscreen_button, g_mute_button, g_volume_label, g_volume_slider, g_trackbar};
+        g_fullscreen_button, g_mute_button, g_volume_slider, g_trackbar};
     for (HWND control : controls) SendMessageW(control, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
     HWND buttons[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
         g_split_button, g_dlss_button, g_model_button, g_multipass_checkbox, g_fullscreen_button, g_mute_button};
