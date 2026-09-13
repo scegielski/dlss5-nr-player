@@ -200,7 +200,8 @@ static ComPtr<ID3D12PipelineState> g_pso_out;  // RGBA16F -> RGBA8 (R/B swap)
 static ComPtr<IDXGISwapChain3> g_swap;
 static HWND g_hwnd = nullptr;
 static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
-static HWND g_split_button = nullptr, g_dlss_button = nullptr, g_model_button = nullptr;
+static HWND g_split_button = nullptr, g_view_mode_label = nullptr;
+static HWND g_dlss_button = nullptr, g_model_button = nullptr;
 static HWND g_passes_slider = nullptr, g_passes_label = nullptr, g_passes_edit = nullptr;
 static HWND g_multipass_checkbox = nullptr;
 static HWND g_prev_frame_button = nullptr, g_next_frame_button = nullptr;
@@ -1044,7 +1045,8 @@ static void UpdateModeTitle()
     std::wstring title = L"DLSS 5 NR Player  —  ";
     title += mode;
     SetWindowTextW(g_hwnd, title.c_str());
-    SetWindowTextW(g_split_button, !g_nr_available ? L"Split: N/A" : (g_side ? L"Split: ON" : L"Split: OFF"));
+    SetWindowTextW(g_view_mode_label, L"View mode:");
+    SetWindowTextW(g_split_button, !g_nr_available ? L"N/A" : (g_side ? L"Split" : L"Normal"));
     SendMessageW(g_split_button, BM_SETCHECK, g_side ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowTextW(g_dlss_button, !g_nr_available ? L"DLSS 5: N/A" : ((g_side || g_nr_enabled) ? L"DLSS 5: ON" : L"DLSS 5: OFF"));
     SendMessageW(g_dlss_button, BM_SETCHECK, (g_side || g_nr_enabled) ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -1341,7 +1343,7 @@ static void LayoutControls(HWND hwnd)
     RECT r; GetClientRect(hwnd, &r);
     int width = r.right, height = r.bottom;
     HWND chrome[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
-        g_split_button, g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
+        g_split_button, g_view_mode_label, g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
         g_fullscreen_button, g_mute_button, g_volume_slider, g_trackbar};
     if (g_fullscreen) {
         for (HWND control : chrome) if (control) ShowWindow(control, SW_HIDE);
@@ -1385,12 +1387,16 @@ static void LayoutControls(HWND hwnd)
     placements[count++] = {g_fullscreen_button, fullscreenX, videoHeight + topRowY, fullscreenWidth, 34};
     placements[count++] = {g_dlss_button, bottomX, videoHeight + bottomRowY, 100, 34};
     placements[count++] = {g_model_button, bottomX + 100 + 6, videoHeight + bottomRowY, 130, 34};
-    placements[count++] = {g_split_button, bottomX + 100 + 6 + 130 + 6,
-        videoHeight + bottomRowY, 90, 34};
-    placements[count++] = {g_multipass_checkbox, bottomX + 100 + 6 + 130 + 6 + 90 + 6,
+    placements[count++] = {g_multipass_checkbox, bottomX + 100 + 6 + 130 + 6,
         videoHeight + bottomRowY, 110, 34};
-    placements[count++] = {g_passes_edit, bottomX + 100 + 6 + 130 + 6 + 90 + 6 + 110 + 6,
+    placements[count++] = {g_passes_edit, bottomX + 100 + 6 + 130 + 6 + 110 + 6,
         videoHeight + bottomRowY + 3, passesEntryWidth, 28};
+    const int viewModeButtonWidth = 90, viewModeLabelWidth = 78;
+    const int viewModeX = width - rightMargin - viewModeButtonWidth;
+    placements[count++] = {g_view_mode_label, viewModeX - 6 - viewModeLabelWidth,
+        videoHeight + bottomRowY + 6, viewModeLabelWidth, 22};
+    placements[count++] = {g_split_button, viewModeX,
+        videoHeight + bottomRowY, 90, 34};
 
     HDWP batch = BeginDeferWindowPos(count);
     for (int i = 0; batch && i < count; ++i)
@@ -1637,6 +1643,8 @@ static bool SetupWindow(UINT w, UINT h)
     DWORD toggleStyle = buttonStyle;
     g_split_button = CreateWindowExW(0, L"BUTTON", L"Split: OFF", toggleStyle,
                                     0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_view_mode_label = CreateWindowExW(0, L"STATIC", L"View mode:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+                                       0, 0, 78, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_dlss_button = CreateWindowExW(0, L"BUTTON", L"DLSS 5: ON", toggleStyle,
                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_model_button = CreateWindowExW(0, L"BUTTON", L"Model: Natural", buttonStyle,
@@ -1661,13 +1669,13 @@ static bool SetupWindow(UINT w, UINT h)
 
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
     if (!g_video_hwnd || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
-        !g_split_button || !g_dlss_button || !g_model_button || !g_multipass_checkbox ||
+        !g_split_button || !g_view_mode_label || !g_dlss_button || !g_model_button || !g_multipass_checkbox ||
         !g_passes_edit || !g_trackbar ||
         !g_mute_button || !g_volume_slider || !g_fullscreen_button) {
         return false;
     }
     HWND controls[] = {g_video_hwnd, g_pause_button, g_prev_frame_button, g_next_frame_button,
-        g_split_button, g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
+        g_split_button, g_view_mode_label, g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
         g_fullscreen_button, g_mute_button, g_volume_slider, g_trackbar};
     for (HWND control : controls) SendMessageW(control, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
     HWND buttons[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
