@@ -1352,27 +1352,18 @@ static void LayoutControls(HWND hwnd)
         return;
     }
     for (HWND control : chrome) if (control) ShowWindow(control, SW_SHOW);
-    struct Control { HWND window; int width; };
-    Control buttons[] = {{g_pause_button, 72}, {g_prev_frame_button, 64},
-        {g_next_frame_button, 64}, {g_split_button, 90}, {g_dlss_button, 100},
-        {g_model_button, 130}, {g_fullscreen_button, 88}};
-    const int NUM_BUTTONS = 7;
-    int x = 8, row = 0;
-    auto place = [&](int controlWidth) {
-        if (x > 8 && x + controlWidth > width - 8) { x = 8; ++row; }
-        POINT pos = {x, row * 42 + 8};
-        x += controlWidth + 6;
-        return pos;
-    };
-    POINT positions[NUM_BUTTONS];
-    for (int i = 0; i < NUM_BUTTONS; ++i) positions[i] = place(buttons[i].width);
-    POINT multipass = place(110);
-    POINT passes = place(passesEntryWidth);
-    POINT audio = {std::max(8, width - audioWidth - 8), passes.y};
-    if (audio.x < passes.x + passesEntryWidth + 12) audio.x = passes.x + passesEntryWidth + 12;
-    if (audio.x + audioWidth > width - 8) audio.x = std::max(8, width - audioWidth - 8);
-    int seekY = (row + 1) * 42 + 8;
-    int videoHeight = std::max(1, height - (seekY + 38));
+    const int topRowY = 8;
+    const int bottomRowY = topRowY + 42;
+    const int transportWidth = 64 + 6 + 72 + 6 + 64;
+    const int fullscreenWidth = 88;
+    const int rightMargin = 8;
+    const int videoHeight = std::max(1, height - (bottomRowY + 34 + 8));
+    const int topX = 8;
+    const int seekX = topX + transportWidth + 6;
+    const int fullscreenX = width - rightMargin - fullscreenWidth;
+    const int audioX = fullscreenX - 6 - audioWidth;
+    const int seekWidth = std::max(1, audioX - 6 - seekX);
+    const int bottomX = 8;
     UINT contentWidth = g_media_loaded ? g_vid_w * (g_side ? 2u : 1u) : 0;
     UINT contentHeight = g_media_loaded ? g_vid_h : 0;
     RECT video = FitVideoRect(width, videoHeight, contentWidth, contentHeight);
@@ -1381,20 +1372,26 @@ static void LayoutControls(HWND hwnd)
     int count = 0;
     placements[count++] = {g_video_hwnd, video.left, video.top,
         video.right - video.left, video.bottom - video.top};
-    for (int i = 0; i < NUM_BUTTONS; ++i)
-        placements[count++] = {buttons[i].window, positions[i].x,
-            videoHeight + positions[i].y, buttons[i].width, 34};
-    placements[count++] = {g_multipass_checkbox, multipass.x,
-        videoHeight + multipass.y, 110, 34};
-    placements[count++] = {g_passes_edit, passes.x,
-        videoHeight + passes.y, passesEntryWidth, 28};
-    placements[count++] = {g_volume_label, audio.x,
-        videoHeight + audio.y + 6, volumeLabelWidth, 22};
-    placements[count++] = {g_volume_slider, audio.x + volumeLabelWidth + 6,
-        videoHeight + audio.y, volumeSliderWidth, 34};
-    placements[count++] = {g_mute_button, audio.x + volumeLabelWidth + 6 + volumeSliderWidth + 6,
-        videoHeight + audio.y, muteWidth, 34};
-    placements[count++] = {g_trackbar, 8, videoHeight + seekY, std::max(1, width - 16), 30};
+    placements[count++] = {g_prev_frame_button, topX, videoHeight + topRowY, 64, 34};
+    placements[count++] = {g_pause_button, topX + 64 + 6, videoHeight + topRowY, 72, 34};
+    placements[count++] = {g_next_frame_button, topX + 64 + 6 + 72 + 6,
+        videoHeight + topRowY, 64, 34};
+    placements[count++] = {g_trackbar, seekX, videoHeight + topRowY + 2, seekWidth, 30};
+    placements[count++] = {g_volume_label, audioX, videoHeight + topRowY + 6,
+        volumeLabelWidth, 22};
+    placements[count++] = {g_volume_slider, audioX + volumeLabelWidth + 6,
+        videoHeight + topRowY, volumeSliderWidth, 34};
+    placements[count++] = {g_mute_button, audioX + volumeLabelWidth + 6 + volumeSliderWidth + 6,
+        videoHeight + topRowY, muteWidth, 34};
+    placements[count++] = {g_fullscreen_button, fullscreenX, videoHeight + topRowY, fullscreenWidth, 34};
+    placements[count++] = {g_dlss_button, bottomX, videoHeight + bottomRowY, 100, 34};
+    placements[count++] = {g_model_button, bottomX + 100 + 6, videoHeight + bottomRowY, 130, 34};
+    placements[count++] = {g_split_button, bottomX + 100 + 6 + 130 + 6,
+        videoHeight + bottomRowY, 90, 34};
+    placements[count++] = {g_multipass_checkbox, bottomX + 100 + 6 + 130 + 6 + 90 + 6,
+        videoHeight + bottomRowY, 110, 34};
+    placements[count++] = {g_passes_edit, bottomX + 100 + 6 + 130 + 6 + 90 + 6 + 110 + 6,
+        videoHeight + bottomRowY + 3, passesEntryWidth, 28};
 
     HDWP batch = BeginDeferWindowPos(count);
     for (int i = 0; batch && i < count; ++i)
