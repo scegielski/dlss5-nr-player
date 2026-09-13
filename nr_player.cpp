@@ -1450,7 +1450,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         break;
     case WM_SIZE: LayoutControls(hwnd); return 0;
     case WM_GETMINMAXINFO:
-        ((MINMAXINFO *)lp)->ptMinTrackSize = {320, 300}; return 0;
+        ((MINMAXINFO *)lp)->ptMinTrackSize = {1150, 700}; return 0;
     case WM_COMMAND:
         if (LOWORD(wp) == ID_FILE_OPEN) { OpenVideoDialog(hwnd); return 0; }
         if (LOWORD(wp) == ID_FILE_EXIT) { SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
