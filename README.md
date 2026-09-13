@@ -16,7 +16,7 @@ This repository contains **source code only**. NVIDIA DLLs, the caller helper, F
 - Step one frame backward or forward with the **Previous Frame** / **Next Frame** buttons or the **Left** / **Right Arrow** keys. Stepping pauses playback and displays the selected frame.
 - Click or drag the seek bar to jump to the pointer position. Seeking while paused displays a preview without resuming playback.
 - Resize the window: the video keeps its original aspect ratio with black letterbox or pillarbox bars, while controls remain visible below it and wrap when needed.
-- **Split** button / **S**: toggle original (left) versus DLSS 5 (right). Split view defaults off.
+- **View mode** button / **S**: cycle **Normal**, **Split**, and **Wipe**. Split places the original and DLSS 5 frames side by side. Wipe overlays them, with the original left of a draggable vertical divider and DLSS 5 to its right.
 - **DLSS 5** button / **D**: toggle neural processing in single view. DLSS defaults on. Comparison always includes DLSS, so the DLSS toggle is disabled there; returning to single view restores the previous setting.
 - **Model** button / **M**: cycle between the Default, Natural, and Cinematic DLSS 5 models. The new model is applied immediately and also works while paused.
 - **Multipass** checkbox: off by default so DLSS 5 NR runs a single feature-18 instance for the fastest possible playback (the original single-pass baseline). Check it to probe and enable the full multipass cascade; toggling while a video is loaded rebuilds the NGX feature set on the fly (a brief stall while the GPU drains and features are re-created).
@@ -89,6 +89,7 @@ Without `--gui`, a command-line input exits at EOF. The legacy `NR_player.bat` f
 | `--gpu N` | DXGI adapter index |
 | `--nr-only` | Single view (default) |
 | `--side-by-side` | Start in comparison view |
+| `--wipe` | Start in draggable wipe comparison view |
 | `--style natural\|cinematic` | NR style |
 | `--preset N` | Render preset (default 3) |
 | `--intensity N`, `--tone N`, `--structure N` | NR tuning |

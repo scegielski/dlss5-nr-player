@@ -114,16 +114,21 @@ int main()
     assert(fitted.top == 0 && fitted.bottom == 600);
     assert(fitted.left == 331 && fitted.right == 668);
 
-    g_media_loaded = true; g_vid_w = 1920; g_vid_h = 1080; g_side = false;
+    g_media_loaded = true; g_vid_w = 1920; g_vid_h = 1080; g_view_mode = ViewMode::Normal;
     SetWindowPos(g_hwnd, nullptr, 0, 0, 1000, 700, SWP_NOMOVE | SWP_NOZORDER);
     LayoutControls(g_hwnd);
     RECT player; GetWindowRect(g_video_hwnd, &player);
     assert(abs((player.right - player.left) * 9 - (player.bottom - player.top) * 16) <= 16);
-    g_side = true;
+    g_view_mode = ViewMode::Split;
     LayoutControls(g_hwnd);
     GetWindowRect(g_video_hwnd, &player);
     assert(abs((player.right - player.left) * 9 - (player.bottom - player.top) * 32) <= 32);
-    g_side = false;
+    g_view_mode = ViewMode::Wipe;
+    LayoutControls(g_hwnd);
+    GetWindowRect(g_video_hwnd, &player);
+    assert(abs((player.right - player.left) * 9 - (player.bottom - player.top) * 16) <= 16);
+    assert(GetWindowLongPtrW(g_wipe_bar, GWL_STYLE) & WS_VISIBLE);
+    g_view_mode = ViewMode::Normal;
     DWORD windowedStyle = (DWORD)GetWindowLongPtrW(g_hwnd, GWL_STYLE);
     HMENU windowedMenu = GetMenu(g_hwnd);
     ToggleFullscreen();

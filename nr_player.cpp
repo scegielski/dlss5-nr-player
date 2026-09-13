@@ -134,7 +134,7 @@ static const wchar_t HOTKEY_HELP_TEXT[] =
     L"Ctrl+O\tOpen a video\r\n"
     L"Space\tPause or resume\r\n"
     L"Left / Right\tPrevious or next frame\r\n"
-    L"S\tToggle split comparison\r\n"
+    L"S\tCycle view mode (Normal / Split / Wipe)\r\n"
     L"D\tToggle DLSS 5\r\n"
     L"M\tCycle DLSS 5 model\r\n"
     L"P\tCycle multipass NR passes\r\n"
@@ -201,6 +201,7 @@ static ComPtr<IDXGISwapChain3> g_swap;
 static HWND g_hwnd = nullptr;
 static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
 static HWND g_split_button = nullptr, g_view_mode_label = nullptr;
+static HWND g_wipe_bar = nullptr;
 static HWND g_dlss_button = nullptr, g_model_button = nullptr;
 static HWND g_passes_slider = nullptr, g_passes_label = nullptr, g_passes_edit = nullptr;
 static HWND g_multipass_checkbox = nullptr;
@@ -237,7 +238,9 @@ static bool g_cuda_decode = false;
 static std::string g_style = "natural";
 static int  g_preset = 3, g_intensity = 1, g_tone = 1, g_structure = 1, g_skin = -1, g_mask = 0;
 static bool g_fast = false;
-static bool g_side = false;  // default: single DLSS 5 view
+enum class ViewMode { Normal, Split, Wipe };
+static ViewMode g_view_mode = ViewMode::Normal;
+static float g_wipe_position = 0.5f; // original left of the divider, DLSS 5 right
 static bool g_nr_enabled = false;
 static bool g_nr_reset = true;
 static bool g_refresh_view = false;
@@ -254,6 +257,10 @@ static HANDLE g_audio_thread = nullptr;
 static volatile bool g_audio_done = false;
 
 static void LayoutControls(HWND hwnd);
+
+static bool IsSplitView() { return g_view_mode == ViewMode::Split; }
+static bool IsComparisonView() { return g_view_mode != ViewMode::Normal; }
+static bool IsNRActive() { return g_nr_available && (IsSplitView() || g_nr_enabled); }
 
 // seek / progress bar state
 static double g_duration = 0.0;      // video duration (seconds)
@@ -367,7 +374,7 @@ static bool CreateDevice()
     if (!g_nr_available)
     {
         g_nr_enabled = false;
-        g_side = false;
+        g_view_mode = ViewMode::Normal;
         Log("DLSS 5 NR is unavailable on this adapter; continuing with original video rendering");
     }
     if (FAILED(D3D12CreateDevice(chosen.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&g_dev))))
@@ -773,8 +780,8 @@ static ThemeColors CurrentThemeColors()
 static bool IsButtonActive(HWND button)
 {
     return (button == g_pause_button && g_paused) ||
-        (button == g_split_button && g_side) ||
-        (button == g_dlss_button && g_nr_available && (g_side || g_nr_enabled)) ||
+        (button == g_split_button && IsComparisonView()) ||
+        (button == g_dlss_button && IsNRActive()) ||
         (button == g_multipass_checkbox && g_multipass_enabled) ||
         (button == g_mute_button && g_muted);
 }
@@ -850,7 +857,7 @@ static void DrawModernButton(const DRAWITEMSTRUCT *draw)
     bool hovered = draw->hwndItem == g_hover_button;
     bool modelButton = draw->hwndItem == g_model_button;
     int modelStyle = StyleValue();
-    bool modelEnabled = g_nr_available && (g_nr_enabled || g_side);
+    bool modelEnabled = IsNRActive();
 
     COLORREF fill = active ? (hovered ? colors.accentHover : colors.accent) :
         (hovered ? colors.buttonHover : colors.button);
@@ -1052,22 +1059,26 @@ static void ApplyTheme(bool dark)
 static void UpdateModeTitle()
 {
     const wchar_t *mode = !g_nr_available ? L"Original (DLSS 5 unavailable)" :
-                         (g_side ? L"Original | DLSS 5" :
-                         (g_nr_enabled ? L"DLSS 5 ON" : L"DLSS 5 OFF - Original"));
+                         g_view_mode == ViewMode::Split ? L"Original | DLSS 5" :
+                         g_view_mode == ViewMode::Wipe ?
+                             (g_nr_enabled ? L"Wipe (DLSS 5 ON)" : L"Wipe (DLSS 5 OFF)") :
+                         g_nr_enabled ? L"DLSS 5 ON" : L"DLSS 5 OFF - Original";
     std::wstring title = L"DLSS 5 NR Player  —  ";
     title += mode;
     SetWindowTextW(g_hwnd, title.c_str());
     SetWindowTextW(g_view_mode_label, L"View mode:");
-    SetWindowTextW(g_split_button, !g_nr_available ? L"N/A" : (g_side ? L"Split" : L"Normal"));
-    SendMessageW(g_split_button, BM_SETCHECK, g_side ? BST_CHECKED : BST_UNCHECKED, 0);
-    SetWindowTextW(g_dlss_button, !g_nr_available ? L"DLSS 5: N/A" : ((g_side || g_nr_enabled) ? L"DLSS 5: ON" : L"DLSS 5: OFF"));
-    SendMessageW(g_dlss_button, BM_SETCHECK, (g_side || g_nr_enabled) ? BST_CHECKED : BST_UNCHECKED, 0);
+    const wchar_t *viewText = g_view_mode == ViewMode::Split ? L"Split" :
+                              g_view_mode == ViewMode::Wipe ? L"Wipe" : L"Normal";
+    SetWindowTextW(g_split_button, !g_nr_available ? L"N/A" : viewText);
+    SendMessageW(g_split_button, BM_SETCHECK, IsComparisonView() ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetWindowTextW(g_dlss_button, !g_nr_available ? L"DLSS 5: N/A" : (IsNRActive() ? L"DLSS 5: ON" : L"DLSS 5: OFF"));
+    SendMessageW(g_dlss_button, BM_SETCHECK, IsNRActive() ? BST_CHECKED : BST_UNCHECKED, 0);
     std::wstring modelText = g_nr_available ? L"Model: " : L"Model: N/A";
     if (g_nr_available) modelText += StyleName();
     SetWindowTextW(g_model_button, modelText.c_str());
     SetWindowTextW(g_multipass_checkbox, !g_nr_available ? L"Multipass: N/A" : (g_multipass_enabled ? L"Multipass: ON" : L"Multipass: OFF"));
     SendMessageW(g_multipass_checkbox, BM_SETCHECK, g_multipass_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    bool nr_controls_enabled = g_nr_available && (g_nr_enabled || g_side);
+    bool nr_controls_enabled = IsNRActive();
     if (g_passes_edit) {
         if (g_nr_available)
             SetWindowTextW(g_passes_edit, std::to_wstring(g_nr_passes).c_str());
@@ -1076,7 +1087,7 @@ static void UpdateModeTitle()
         EnableWindow(g_passes_edit, nr_controls_enabled && g_multipass_enabled && g_nr_max_passes > 1);
     }
     EnableWindow(g_split_button, nr_controls_enabled);
-    EnableWindow(g_dlss_button, g_nr_available && !g_side);
+    EnableWindow(g_dlss_button, g_nr_available && !IsSplitView());
     EnableWindow(g_model_button, nr_controls_enabled);
     EnableWindow(g_multipass_checkbox, nr_controls_enabled);
     EnableWindow(g_pause_button, g_media_loaded);
@@ -1088,20 +1099,24 @@ static void UpdateModeTitle()
     EnableWindow(g_mute_button, g_media_loaded);
     if (!g_media_loaded) SetWindowTextW(g_hwnd, L"DLSS 5 NR Player - Open a video");
     Log("view: %s", !g_nr_available ? "Original (DLSS 5 unavailable)" :
-         (g_side ? "Original | DLSS 5" : (g_nr_enabled ? "DLSS 5 ON" : "DLSS 5 OFF - Original")));
+         g_view_mode == ViewMode::Split ? "Original | DLSS 5" :
+         g_view_mode == ViewMode::Wipe ?
+             (g_nr_enabled ? "Wipe (DLSS 5 ON)" : "Wipe (DLSS 5 OFF)") :
+         g_nr_enabled ? "DLSS 5 ON" : "DLSS 5 OFF - Original");
 }
 
 static void ToggleComparison()
 {
-    if (!g_nr_available || (!g_nr_enabled && !g_side)) return;
-    if (!g_swap) { g_side = !g_side; UpdateModeTitle(); return; }
+    if (!g_nr_available || (!g_nr_enabled && !IsComparisonView())) return;
+    ViewMode next = g_view_mode == ViewMode::Normal ? ViewMode::Split :
+                    g_view_mode == ViewMode::Split ? ViewMode::Wipe : ViewMode::Normal;
+    if (!g_swap) { g_view_mode = next; UpdateModeTitle(); return; }
     for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i)
         WaitFence(g_fence[i].Get(), g_fence_value[i]);
-    bool side = !g_side;
-    HRESULT hr = g_swap->ResizeBuffers(0, side ? g_vid_w * 2 : g_vid_w,
+    HRESULT hr = g_swap->ResizeBuffers(0, next == ViewMode::Split ? g_vid_w * 2 : g_vid_w,
                                        g_vid_h, DXGI_FORMAT_UNKNOWN, 0);
     if (FAILED(hr)) { Log("FAIL: resize comparison buffers -> 0x%08X", (unsigned)hr); return; }
-    g_side = side;
+    g_view_mode = next;
     g_nr_reset = true;
     g_refresh_view = true;
     LayoutControls(g_hwnd);
@@ -1111,16 +1126,17 @@ static void ToggleComparison()
 static void ToggleNR()
 {
     if (!g_nr_available) return;
-    if (g_side) return; // comparison always shows original alongside NR
+    if (IsSplitView()) return; // split always shows original alongside NR
     g_nr_enabled = !g_nr_enabled;
     g_nr_reset = true;
     g_refresh_view = true;
+    LayoutControls(g_hwnd);
     UpdateModeTitle();
 }
 
 static void CycleModel()
 {
-    if (!g_nr_available || (!g_nr_enabled && !g_side)) return;
+    if (!IsNRActive()) return;
     int next = StyleValue() + 1;
     if (next < 0 || next > 2) next = 0;
     static const char *styles[] = { "default", "natural", "cinematic" };
@@ -1134,7 +1150,7 @@ static void CycleModel()
 
 static void SetPasses(int passes)
 {
-    if (!g_nr_available || (!g_nr_enabled && !g_side)) return;
+    if (!IsNRActive()) return;
     passes = std::max(1, std::min(g_nr_max_passes, passes));
     if (passes == g_nr_passes) return;
     g_nr_passes = passes;
@@ -1167,7 +1183,7 @@ static void CyclePasses()
 // fastest-playback configuration); turning it on re-probes up to MAX_NR_PASSES.
 static void ToggleMultipass()
 {
-    if (!g_nr_available || (!g_nr_enabled && !g_side)) return;
+    if (!IsNRActive()) return;
     g_multipass_enabled = !g_multipass_enabled;
     Log("multipass: %s", g_multipass_enabled ? "ON" : "OFF");
 
@@ -1182,7 +1198,7 @@ static void ToggleMultipass()
             g_list->Close();
             g_nr_available = false;
             g_nr_enabled = false;
-            g_side = false;
+            g_view_mode = ViewMode::Normal;
             Log("NGX setup failed after multipass toggle; DLSS 5 NR disabled");
         }
         g_nr_reset = true;
@@ -1320,6 +1336,137 @@ static RECT FitVideoRect(int areaWidth, int areaHeight, UINT contentWidth, UINT 
     return result;
 }
 
+static void UpdateWipeBarLayout()
+{
+    if (!g_wipe_bar || !g_video_hwnd) return;
+    if (g_view_mode != ViewMode::Wipe || !g_media_loaded || !g_nr_enabled) {
+        ShowWindow(g_wipe_bar, SW_HIDE);
+        return;
+    }
+    RECT video = {};
+    GetClientRect(g_video_hwnd, &video);
+    const int width = std::max(1L, video.right - video.left);
+    const int barWidth = 1;
+    int center = (int)(g_wipe_position * width + 0.5f);
+    int x = std::max(0, std::min(width - barWidth, center - barWidth / 2));
+    SetWindowPos(g_wipe_bar, HWND_TOP, x, 0, barWidth,
+        std::max(1L, video.bottom - video.top), SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_wipe_bar, nullptr, FALSE);
+}
+
+static void SetWipePositionFromMouse(HWND hwnd, LPARAM lp)
+{
+    POINT point = {(short)LOWORD(lp), (short)HIWORD(lp)};
+    MapWindowPoints(hwnd, g_video_hwnd, &point, 1);
+    RECT video = {};
+    GetClientRect(g_video_hwnd, &video);
+    int width = std::max(1L, video.right - video.left);
+    g_wipe_position = (float)std::max(0, std::min(width, (int)point.x)) / width;
+    UpdateWipeBarLayout();
+    g_refresh_view = true;
+}
+
+static bool IsWipeDividerHit(HWND hwnd, LPARAM lp)
+{
+    if (g_view_mode != ViewMode::Wipe || !g_media_loaded) return false;
+    RECT video = {};
+    GetClientRect(hwnd, &video);
+    int width = std::max(1L, video.right - video.left);
+    int divider = (int)(g_wipe_position * width + 0.5f);
+    int mouseX = (short)LOWORD(lp);
+    return abs(mouseX - divider) <= 14;
+}
+
+static LRESULT CALLBACK WipeBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
+                                    UINT_PTR id, DWORD_PTR)
+{
+    switch (message) {
+    case WM_NCHITTEST:
+        // Let the video surface own hit testing so a drag cannot become a
+        // STATIC-control click (which toggles pause).
+        return HTTRANSPARENT;
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint = {};
+        HDC dc = BeginPaint(hwnd, &paint);
+        RECT rect = {};
+        GetClientRect(hwnd, &rect);
+        ThemeColors colors = CurrentThemeColors();
+        HBRUSH brush = CreateSolidBrush(colors.accent);
+        FillRect(dc, &rect, brush);
+        DeleteObject(brush);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_SIZEWE));
+        return TRUE;
+    case WM_LBUTTONDOWN:
+        SetCapture(hwnd);
+        SetWipePositionFromMouse(hwnd, lp);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (GetCapture() == hwnd) SetWipePositionFromMouse(hwnd, lp);
+        return 0;
+    case WM_LBUTTONUP:
+        if (GetCapture() == hwnd) {
+            SetWipePositionFromMouse(hwnd, lp);
+            ReleaseCapture();
+        }
+        return 0;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, WipeBarProc, id);
+        break;
+    }
+    return DefSubclassProc(hwnd, message, wp, lp);
+}
+
+static LRESULT CALLBACK VideoSurfaceProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
+                                         UINT_PTR id, DWORD_PTR)
+{
+    switch (message) {
+    case WM_SETCURSOR:
+    {
+        POINT point = {};
+        GetCursorPos(&point);
+        ScreenToClient(hwnd, &point);
+        LPARAM mouse = MAKELPARAM((short)point.x, (short)point.y);
+        if (IsWipeDividerHit(hwnd, mouse)) {
+            SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_SIZEWE));
+            return TRUE;
+        }
+        break;
+    }
+    case WM_LBUTTONDOWN:
+        if (IsWipeDividerHit(hwnd, lp)) {
+            SetCapture(hwnd);
+            SetWipePositionFromMouse(hwnd, lp);
+            return 0;
+        }
+        break;
+    case WM_MOUSEMOVE:
+        if (GetCapture() == hwnd) {
+            SetWipePositionFromMouse(hwnd, lp);
+            SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_SIZEWE));
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (GetCapture() == hwnd) {
+            SetWipePositionFromMouse(hwnd, lp);
+            ReleaseCapture();
+            return 0;
+        }
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, VideoSurfaceProc, id);
+        break;
+    }
+    return DefSubclassProc(hwnd, message, wp, lp);
+}
+
 static void ToggleFullscreen()
 {
     if (!g_hwnd || (!g_fullscreen && !g_media_loaded)) return;
@@ -1361,11 +1508,12 @@ static void LayoutControls(HWND hwnd)
         g_fullscreen_button, g_mute_button, g_volume_slider, g_trackbar};
     if (g_fullscreen) {
         for (HWND control : chrome) if (control) ShowWindow(control, SW_HIDE);
-        UINT contentWidth = g_vid_w * (g_side ? 2u : 1u);
+        UINT contentWidth = g_vid_w * (IsSplitView() ? 2u : 1u);
         RECT video = FitVideoRect(width, height, contentWidth, g_vid_h);
         SetWindowPos(g_video_hwnd, nullptr, video.left, video.top,
             video.right - video.left, video.bottom - video.top,
             SWP_NOZORDER | SWP_NOACTIVATE);
+        UpdateWipeBarLayout();
         RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
         return;
     }
@@ -1382,7 +1530,7 @@ static void LayoutControls(HWND hwnd)
     const int audioX = fullscreenX - 6 - audioWidth;
     const int seekWidth = std::max(1, audioX - 6 - seekX);
     const int bottomX = 8;
-    UINT contentWidth = g_media_loaded ? g_vid_w * (g_side ? 2u : 1u) : 0;
+    UINT contentWidth = g_media_loaded ? g_vid_w * (IsSplitView() ? 2u : 1u) : 0;
     UINT contentHeight = g_media_loaded ? g_vid_h : 0;
     RECT video = FitVideoRect(width, videoHeight, contentWidth, contentHeight);
     struct Placement { HWND window; int x, y, width, height; };
@@ -1427,6 +1575,7 @@ static void LayoutControls(HWND hwnd)
     SetWindowPos(g_video_hwnd, HWND_BOTTOM, video.left, video.top,
         video.right - video.left, video.bottom - video.top,
         SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    UpdateWipeBarLayout();
     SetWindowPos(g_trackbar, HWND_TOP, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     SetWindowPos(g_volume_slider, HWND_TOP, 0, 0, 0, 0,
@@ -1614,7 +1763,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
 static bool SetupWindow(UINT w, UINT h)
 {
     if (!g_hwnd) {
-    UINT dw = g_side ? w * 2 : w; // side-by-side doubles the width
+    UINT dw = IsSplitView() ? w * 2 : w; // split view doubles the width
     const UINT TBH = 76;          // controls stay outside the video surface
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
@@ -1653,8 +1802,10 @@ static bool SetupWindow(UINT w, UINT h)
     DragAcceptFiles(g_hwnd, TRUE);
 
     DWORD buttonStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW;
-    g_video_hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOTIFY | SS_CENTER | SS_CENTERIMAGE,
+    g_video_hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | SS_NOTIFY | SS_CENTER | SS_CENTERIMAGE,
                                   0, 0, dw, h, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_wipe_bar = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_CLIPSIBLINGS,
+                                 0, 0, 1, h, g_video_hwnd, nullptr, wc.hInstance, nullptr);
     g_pause_button = CreateWindowExW(0, L"BUTTON", L"Pause", buttonStyle,
                                     0, 0, 72, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_prev_frame_button = CreateWindowExW(0, L"BUTTON", L"\x25C0", buttonStyle,
@@ -1689,7 +1840,7 @@ static bool SetupWindow(UINT w, UINT h)
                                  0, h, dw, TBH, g_hwnd, nullptr, wc.hInstance, nullptr);
 
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
-    if (!g_video_hwnd || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
+    if (!g_video_hwnd || !g_wipe_bar || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
         !g_split_button || !g_view_mode_label || !g_dlss_button || !g_model_button || !g_multipass_checkbox ||
         !g_passes_edit || !g_trackbar ||
         !g_mute_button || !g_volume_slider || !g_fullscreen_button) {
@@ -1709,6 +1860,12 @@ static bool SetupWindow(UINT w, UINT h)
     if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) {
         return false;
     }
+    if (!SetWindowSubclass(g_wipe_bar, WipeBarProc, 3, 0)) {
+        return false;
+    }
+    if (!SetWindowSubclass(g_video_hwnd, VideoSurfaceProc, 4, 0)) {
+        return false;
+    }
     ApplyTheme(true);
     LayoutControls(g_hwnd);
     }
@@ -1723,7 +1880,7 @@ static bool SetupWindow(UINT w, UINT h)
     LayoutControls(g_hwnd);
 
     DXGI_SWAP_CHAIN_DESC1 sd = {};
-    sd.Width = g_side ? w * 2 : w; sd.Height = h;
+    sd.Width = IsSplitView() ? w * 2 : w; sd.Height = h;
     sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -2061,7 +2218,7 @@ static void RenderFrame(const uint8_t *nv12)
     bars[nb++] = Trans(g_nr_in.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     g_list->ResourceBarrier(nb, bars);
 
-    bool useNR = g_nr_available && (g_side || g_nr_enabled);
+    bool useNR = IsNRActive();
     if (useNR) {
         bool reset = (g_frame_index == 0 || g_nr_reset);
 
@@ -2104,7 +2261,7 @@ static void RenderFrame(const uint8_t *nv12)
     nb = 0;
     bars[nb++] = Trans(g_nr_out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     bars[nb++] = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (g_side)
+    if (IsComparisonView())
         bars[nb++] = Trans(g_orig_rgba.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g_list->ResourceBarrier(nb, bars);
 
@@ -2114,8 +2271,8 @@ static void RenderFrame(const uint8_t *nv12)
     g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 4 * inc });      // stage UAV
     g_list->Dispatch((g_vid_w + 15) / 16, (g_vid_h + 15) / 16, 1);
 
-    // cs2: NR input (original) -> orig (left side), side-by-side only
-    if (g_side)
+    // cs2: NR input (original) -> orig for split and wipe comparisons
+    if (IsComparisonView())
     {
         g_list->SetComputeRootDescriptorTable(0, { h0.ptr + 5 * inc });  // nr_in SRV
         g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 6 * inc });  // orig UAV
@@ -2128,7 +2285,7 @@ static void RenderFrame(const uint8_t *nv12)
     g_swap->GetBuffer(bb, IID_PPV_ARGS(&backbuffer));
     nb = 0;
     bars[nb++] = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    if (g_side)
+    if (IsComparisonView())
         bars[nb++] = Trans(g_orig_rgba.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     bars[nb++] = Trans(backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
     g_list->ResourceBarrier(nb, bars);
@@ -2137,7 +2294,7 @@ static void RenderFrame(const uint8_t *nv12)
     d2.pResource = backbuffer.Get();
     d2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     d2.SubresourceIndex = 0;
-    if (g_side)
+    if (g_view_mode == ViewMode::Split)
     {
         D3D12_TEXTURE_COPY_LOCATION so = {};
         so.pResource = g_orig_rgba.Get();
@@ -2149,6 +2306,24 @@ static void RenderFrame(const uint8_t *nv12)
         s2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         s2.SubresourceIndex = 0;
         g_list->CopyTextureRegion(&d2, g_vid_w, 0, 0, &s2, nullptr);
+    }
+    else if (g_view_mode == ViewMode::Wipe)
+    {
+        UINT wipeX = std::min(g_vid_w, (UINT)(g_wipe_position * g_vid_w + 0.5f));
+        if (wipeX > 0) {
+            D3D12_TEXTURE_COPY_LOCATION source = {};
+            source.pResource = g_orig_rgba.Get();
+            source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            D3D12_BOX box = {0, 0, 0, wipeX, g_vid_h, 1};
+            g_list->CopyTextureRegion(&d2, 0, 0, 0, &source, &box);
+        }
+        if (wipeX < g_vid_w) {
+            D3D12_TEXTURE_COPY_LOCATION source = {};
+            source.pResource = g_stage_rgba.Get();
+            source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            D3D12_BOX box = {wipeX, 0, 0, g_vid_w, g_vid_h, 1};
+            g_list->CopyTextureRegion(&d2, wipeX, 0, 0, &source, &box);
+        }
     }
     else
     {
@@ -2182,7 +2357,7 @@ static void RenderFrame(const uint8_t *nv12)
     nb = 0;
     bars[nb++] = Trans(backbuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
     bars[nb++] = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    if (g_side)
+    if (IsComparisonView())
         bars[nb++] = Trans(g_orig_rgba.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     bars[nb++] = Trans(g_nr_out.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g_list->ResourceBarrier(nb, bars);
@@ -2288,7 +2463,7 @@ static int PlayVideo(const std::wstring &input)
         ReleaseNGXObjects();
         g_nr_available = false;
         g_nr_enabled = false;
-        g_side = false;
+        g_view_mode = ViewMode::Normal;
         Log("NGX setup failed; continuing with original video rendering");
     }
     if (!SetupCompute()) Fatal("compute failed");
@@ -2551,8 +2726,9 @@ int wmain(int argc, wchar_t **argv)
             if (v > 1) g_multipass_enabled = true; // an explicit multi-pass request implies enabling it
         }
         else if (a == L"--fast") g_fast = true;
-        else if (a == L"--nr-only") g_side = false;
-        else if (a == L"--side-by-side") g_side = true;
+        else if (a == L"--nr-only") g_view_mode = ViewMode::Normal;
+        else if (a == L"--side-by-side") g_view_mode = ViewMode::Split;
+        else if (a == L"--wipe") g_view_mode = ViewMode::Wipe;
         else if (a == L"--dump" && i + 1 < argc) g_dump_path = argv[++i];
         else if (a == L"--output" && i + 1 < argc) g_output = argv[++i];
         else if (a == L"--crf" && i + 1 < argc) g_crf = _wtoi(argv[++i]);
