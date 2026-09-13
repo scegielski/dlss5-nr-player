@@ -205,6 +205,8 @@ static HWND g_split_button = nullptr, g_view_mode_label = nullptr;
 static HWND g_wipe_bar = nullptr;
 static HWND g_dlss_button = nullptr, g_model_button = nullptr;
 static HWND g_intensity_slider = nullptr, g_intensity_label = nullptr;
+static HWND g_tone_slider = nullptr, g_tone_label = nullptr;
+static HWND g_structure_slider = nullptr, g_structure_label = nullptr;
 static HWND g_passes_slider = nullptr, g_passes_label = nullptr, g_passes_edit = nullptr;
 static HWND g_multipass_checkbox = nullptr;
 static HWND g_prev_frame_button = nullptr, g_next_frame_button = nullptr;
@@ -238,8 +240,8 @@ static double g_fps = 30.0;
 static int  g_gpu_index = -1;
 static bool g_cuda_decode = false;
 static std::string g_style = "natural";
-static int  g_preset = 3, g_tone = 1, g_structure = 1, g_skin = -1, g_mask = 0;
-static float g_intensity = 1.0f;
+static int  g_preset = 3, g_skin = -1, g_mask = 0;
+static float g_intensity = 1.0f, g_tone = 1.0f, g_structure = 1.0f;
 static bool g_fast = false;
 enum class ViewMode { Normal, Split, Wipe };
 static ViewMode g_view_mode = ViewMode::Normal;
@@ -427,8 +429,8 @@ static void ConfigureNRParams(NVSDK_NGX_Parameter *params, UINT w, UINT h)
     params->Set("DLSSNR.Style", StyleValue());
     params->Set("DLSSNR.Hint.Render.Preset", g_preset);
     params->Set("DLSSNR.Intensity", 1.0f);
-    params->Set("DLSSNR.LocalToneStrength", (float)g_tone);
-    params->Set("DLSSNR.LocalStructureStrength", (float)g_structure);
+    params->Set("DLSSNR.LocalToneStrength", g_tone);
+    params->Set("DLSSNR.LocalStructureStrength", g_structure);
     params->Set("DLSSNR.SkinStructureStrength", (float)g_skin);
     params->Set("DLSSNR.UseAutoMask", g_mask);
     params->Set("DLSSNR.UICorrection", 0);
@@ -504,6 +506,8 @@ static void EvaluateNRStage(NVSDK_NGX_Parameter *params, NVSDK_NGX_Handle *featu
     params->Set("DLSSNR.Backbuffer", output);
     params->Set("DLSSNR.Reset", reset ? 1 : 0);
     params->Set("DLSSNR.Intensity", 1.0f);
+    params->Set("DLSSNR.LocalToneStrength", g_tone);
+    params->Set("DLSSNR.LocalStructureStrength", g_structure);
     NVSDK_NGX_Result re;
     if (g_nr_eval && g_shim_eval)
         re = g_shim_eval((void *)g_nr_eval, g_list.Get(), feature, params, nullptr);
@@ -516,6 +520,12 @@ static void SetAllNRStyles(int style)
 {
     for (NVSDK_NGX_Parameter *p : g_nr_params)
         if (p) p->Set("DLSSNR.Style", style);
+}
+
+static void SetAllNRFloatParameter(const char *name, float value)
+{
+    for (NVSDK_NGX_Parameter *p : g_nr_params)
+        if (p) p->Set(name, value);
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,9 +1076,12 @@ static void ApplyTheme(bool dark)
         SetWindowTheme(g_hwnd, dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
         SetMenuBackgrounds(GetMenu(g_hwnd));
     }
-    HWND themed[] = {g_volume_slider, g_intensity_slider, g_trackbar};
+    HWND themed[] = {g_volume_slider, g_intensity_slider, g_tone_slider,
+        g_structure_slider, g_trackbar};
     if (g_volume_slider) SetWindowTheme(g_volume_slider, L"Explorer", nullptr);
     if (g_intensity_slider) SetWindowTheme(g_intensity_slider, L"Explorer", nullptr);
+    if (g_tone_slider) SetWindowTheme(g_tone_slider, L"Explorer", nullptr);
+    if (g_structure_slider) SetWindowTheme(g_structure_slider, L"Explorer", nullptr);
     if (g_trackbar) SetWindowTheme(g_trackbar, L"", L"");
     if (g_hwnd) {
         SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
@@ -1111,7 +1124,21 @@ static void UpdateModeTitle()
         else wcscpy_s(intensityText, L"Intensity: N/A");
         SetWindowTextW(g_intensity_label, intensityText);
     }
+    if (g_tone_label) {
+        wchar_t toneText[32] = {};
+        if (g_nr_available) swprintf_s(toneText, L"Tone: %.2f", g_tone);
+        else wcscpy_s(toneText, L"Tone: N/A");
+        SetWindowTextW(g_tone_label, toneText);
+    }
+    if (g_structure_label) {
+        wchar_t structureText[32] = {};
+        if (g_nr_available) swprintf_s(structureText, L"Structure: %.2f", g_structure);
+        else wcscpy_s(structureText, L"Structure: N/A");
+        SetWindowTextW(g_structure_label, structureText);
+    }
     EnableWindow(g_intensity_slider, nr_controls_enabled);
+    EnableWindow(g_tone_slider, nr_controls_enabled);
+    EnableWindow(g_structure_slider, nr_controls_enabled);
     if (g_passes_edit) {
         if (g_nr_available)
             SetWindowTextW(g_passes_edit, std::to_wstring(g_nr_passes).c_str());
@@ -1189,6 +1216,28 @@ static void SetIntensity(float intensity)
     g_refresh_view = true;
     UpdateModeTitle();
     Log("DLSS blend intensity: %.2f", g_intensity);
+}
+
+static void SetTone(float tone)
+{
+    tone = std::max(0.0f, std::min(2.0f, tone));
+    if (tone == g_tone) return;
+    g_tone = tone;
+    SetAllNRFloatParameter("DLSSNR.LocalToneStrength", g_tone);
+    g_refresh_view = true;
+    UpdateModeTitle();
+    Log("DLSS NR tone strength: %.2f", g_tone);
+}
+
+static void SetStructure(float structure)
+{
+    structure = std::max(0.0f, std::min(2.0f, structure));
+    if (structure == g_structure) return;
+    g_structure = structure;
+    SetAllNRFloatParameter("DLSSNR.LocalStructureStrength", g_structure);
+    g_refresh_view = true;
+    UpdateModeTitle();
+    Log("DLSS NR structure strength: %.2f", g_structure);
 }
 
 static void SetPasses(int passes)
@@ -1548,6 +1597,7 @@ static void LayoutControls(HWND hwnd)
     int width = r.right, height = r.bottom;
     HWND chrome[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
         g_split_button, g_view_mode_label, g_intensity_label, g_intensity_slider,
+        g_tone_label, g_tone_slider, g_structure_label, g_structure_slider,
         g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
         g_fullscreen_button, g_mute_button, g_volume_slider, g_trackbar};
     if (g_fullscreen) {
@@ -1578,7 +1628,7 @@ static void LayoutControls(HWND hwnd)
     UINT contentHeight = g_media_loaded ? g_vid_h : 0;
     RECT video = FitVideoRect(width, videoHeight, contentWidth, contentHeight);
     struct Placement { HWND window; int x, y, width, height; };
-    Placement placements[16];
+    Placement placements[20];
     int count = 0;
     placements[count++] = {g_video_hwnd, video.left, video.top,
         video.right - video.left, video.bottom - video.top};
@@ -1593,17 +1643,29 @@ static void LayoutControls(HWND hwnd)
     placements[count++] = {g_fullscreen_button, fullscreenX, videoHeight + topRowY, fullscreenWidth, 34};
     const int dlssX = bottomX;
     placements[count++] = {g_dlss_button, dlssX, videoHeight + bottomRowY, 100, 34};
-    const int intensityLabelWidth = 98, intensitySliderWidth = 100;
-    const int intensityX = dlssX + 100 + 6;
+    const int modelX = dlssX + 100 + 6;
+    placements[count++] = {g_model_button, modelX, videoHeight + bottomRowY, 130, 34};
+    const int intensityLabelWidth = 104, toneLabelWidth = 72, structureLabelWidth = 100;
+    const int tuningSliderWidth = 70;
+    const int intensityX = modelX + 130 + 6;
     placements[count++] = {g_intensity_label, intensityX,
         videoHeight + bottomRowY + 6, intensityLabelWidth, 22};
     placements[count++] = {g_intensity_slider, intensityX + intensityLabelWidth + 4,
-        videoHeight + bottomRowY + 2, intensitySliderWidth, 30};
-    const int modelX = intensityX + intensityLabelWidth + 4 + intensitySliderWidth + 6;
-    placements[count++] = {g_model_button, modelX, videoHeight + bottomRowY, 130, 34};
-    placements[count++] = {g_multipass_checkbox, modelX + 130 + 6,
+        videoHeight + bottomRowY + 2, tuningSliderWidth, 30};
+    const int toneX = intensityX + intensityLabelWidth + 4 + tuningSliderWidth + 6;
+    placements[count++] = {g_tone_label, toneX,
+        videoHeight + bottomRowY + 6, toneLabelWidth, 22};
+    placements[count++] = {g_tone_slider, toneX + toneLabelWidth + 4,
+        videoHeight + bottomRowY + 2, tuningSliderWidth, 30};
+    const int structureX = toneX + toneLabelWidth + 4 + tuningSliderWidth + 6;
+    placements[count++] = {g_structure_label, structureX,
+        videoHeight + bottomRowY + 6, structureLabelWidth, 22};
+    placements[count++] = {g_structure_slider, structureX + structureLabelWidth + 4,
+        videoHeight + bottomRowY + 2, tuningSliderWidth, 30};
+    const int multipassX = structureX + structureLabelWidth + 4 + tuningSliderWidth + 6;
+    placements[count++] = {g_multipass_checkbox, multipassX,
         videoHeight + bottomRowY, 110, 34};
-    placements[count++] = {g_passes_edit, modelX + 130 + 6 + 110 + 6,
+    placements[count++] = {g_passes_edit, multipassX + 110 + 6,
         videoHeight + bottomRowY + 3, passesEntryWidth, 28};
     const int viewModeButtonWidth = 90, viewModeLabelWidth = 78;
     const int viewModeX = width - rightMargin - viewModeButtonWidth;
@@ -1742,6 +1804,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if (((NMHDR *)lp)->code == NM_CUSTOMDRAW &&
             (((NMHDR *)lp)->hwndFrom == g_volume_slider ||
              ((NMHDR *)lp)->hwndFrom == g_intensity_slider ||
+             ((NMHDR *)lp)->hwndFrom == g_tone_slider ||
+             ((NMHDR *)lp)->hwndFrom == g_structure_slider ||
              ((NMHDR *)lp)->hwndFrom == g_trackbar))
             return DrawModernTrackbar((NMCUSTOMDRAW *)lp);
         break;
@@ -1786,6 +1850,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
     case WM_HSCROLL:
         if ((HWND)lp == g_intensity_slider) {
             SetIntensity((float)SendMessageW(g_intensity_slider, TBM_GETPOS, 0, 0) / 100.0f);
+            return 0;
+        }
+        if ((HWND)lp == g_tone_slider) {
+            SetTone((float)SendMessageW(g_tone_slider, TBM_GETPOS, 0, 0) / 100.0f);
+            WORD code = LOWORD(wp);
+            if (code == TB_THUMBPOSITION || code == TB_ENDTRACK) g_nr_reset = true;
+            return 0;
+        }
+        if ((HWND)lp == g_structure_slider) {
+            SetStructure((float)SendMessageW(g_structure_slider, TBM_GETPOS, 0, 0) / 100.0f);
+            WORD code = LOWORD(wp);
+            if (code == TB_THUMBPOSITION || code == TB_ENDTRACK) g_nr_reset = true;
             return 0;
         }
         if ((HWND)lp == g_volume_slider) {
@@ -1875,16 +1951,38 @@ static bool SetupWindow(UINT w, UINT h)
                                     0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_view_mode_label = CreateWindowExW(0, L"STATIC", L"View mode:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                                        0, 0, 78, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_intensity_label = CreateWindowExW(0, L"STATIC", L"Intensity: 1.00", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                       0, 0, 98, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_intensity_label = CreateWindowExW(0, L"STATIC", L"Intensity: 1.00", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
+                                       0, 0, 104, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_intensity_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Intensity",
                                         WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
-                                        0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+                                        0, 0, 70, 30, g_hwnd, nullptr, wc.hInstance, nullptr);
     if (g_intensity_slider) {
         SendMessageW(g_intensity_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
         SendMessageW(g_intensity_slider, TBM_SETPAGESIZE, 0, 10);
         int intensityPosition = (int)(std::max(0.0f, std::min(2.0f, g_intensity)) * 100.0f + 0.5f);
         SendMessageW(g_intensity_slider, TBM_SETPOS, TRUE, intensityPosition);
+    }
+    g_tone_label = CreateWindowExW(0, L"STATIC", L"Tone: 1.00", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
+                                  0, 0, 72, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_tone_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Tone",
+                                   WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
+                                   0, 0, 70, 30, g_hwnd, nullptr, wc.hInstance, nullptr);
+    if (g_tone_slider) {
+        SendMessageW(g_tone_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
+        SendMessageW(g_tone_slider, TBM_SETPAGESIZE, 0, 10);
+        int tonePosition = (int)(std::max(0.0f, std::min(2.0f, g_tone)) * 100.0f + 0.5f);
+        SendMessageW(g_tone_slider, TBM_SETPOS, TRUE, tonePosition);
+    }
+    g_structure_label = CreateWindowExW(0, L"STATIC", L"Structure: 1.00", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
+                                       0, 0, 100, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_structure_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Structure",
+                                        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
+                                        0, 0, 70, 30, g_hwnd, nullptr, wc.hInstance, nullptr);
+    if (g_structure_slider) {
+        SendMessageW(g_structure_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
+        SendMessageW(g_structure_slider, TBM_SETPAGESIZE, 0, 10);
+        int structurePosition = (int)(std::max(0.0f, std::min(2.0f, g_structure)) * 100.0f + 0.5f);
+        SendMessageW(g_structure_slider, TBM_SETPOS, TRUE, structurePosition);
     }
     g_dlss_button = CreateWindowExW(0, L"BUTTON", L"DLSS 5: ON", toggleStyle,
                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
@@ -1911,6 +2009,7 @@ static bool SetupWindow(UINT w, UINT h)
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
     if (!g_video_hwnd || !g_wipe_bar || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
         !g_split_button || !g_view_mode_label || !g_intensity_label || !g_intensity_slider ||
+        !g_tone_label || !g_tone_slider || !g_structure_label || !g_structure_slider ||
         !g_dlss_button || !g_model_button || !g_multipass_checkbox ||
         !g_passes_edit || !g_trackbar ||
         !g_mute_button || !g_volume_slider || !g_fullscreen_button) {
@@ -1918,6 +2017,7 @@ static bool SetupWindow(UINT w, UINT h)
     }
     HWND controls[] = {g_video_hwnd, g_pause_button, g_prev_frame_button, g_next_frame_button,
         g_split_button, g_view_mode_label, g_intensity_label, g_intensity_slider,
+        g_tone_label, g_tone_slider, g_structure_label, g_structure_slider,
         g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
         g_fullscreen_button, g_mute_button, g_volume_slider, g_trackbar};
     for (HWND control : controls) SendMessageW(control, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
@@ -2798,8 +2898,10 @@ int wmain(int argc, wchar_t **argv)
         else if (a == L"--preset" && i + 1 < argc) g_preset = _wtoi(argv[++i]);
         else if (a == L"--intensity" && i + 1 < argc)
             g_intensity = std::max(0.0f, std::min(2.0f, (float)_wtof(argv[++i])));
-        else if (a == L"--tone" && i + 1 < argc) g_tone = _wtoi(argv[++i]);
-        else if (a == L"--structure" && i + 1 < argc) g_structure = _wtoi(argv[++i]);
+        else if (a == L"--tone" && i + 1 < argc)
+            g_tone = std::max(0.0f, std::min(2.0f, (float)_wtof(argv[++i])));
+        else if (a == L"--structure" && i + 1 < argc)
+            g_structure = std::max(0.0f, std::min(2.0f, (float)_wtof(argv[++i])));
         else if (a == L"--skin" && i + 1 < argc) g_skin = _wtoi(argv[++i]);
         else if (a == L"--mask" && i + 1 < argc) g_mask = _wtoi(argv[++i]);
         else if (a == L"--passes" && i + 1 < argc)
