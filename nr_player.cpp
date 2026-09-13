@@ -1023,8 +1023,8 @@ static void ApplyTheme(bool dark)
         SetMenuBackgrounds(GetMenu(g_hwnd));
     }
     HWND themed[] = {g_volume_slider, g_trackbar};
-    for (HWND control : themed) if (control)
-        SetWindowTheme(control, L"", L"");
+    if (g_volume_slider) SetWindowTheme(g_volume_slider, L"Explorer", nullptr);
+    if (g_trackbar) SetWindowTheme(g_trackbar, L"", L"");
     if (g_hwnd) {
         SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
@@ -1072,6 +1072,8 @@ static void UpdateModeTitle()
     EnableWindow(g_next_frame_button, g_media_loaded);
     EnableWindow(g_trackbar, g_media_loaded);
     EnableWindow(g_fullscreen_button, g_media_loaded);
+    EnableWindow(g_volume_slider, g_media_loaded);
+    EnableWindow(g_mute_button, g_media_loaded);
     if (!g_media_loaded) SetWindowTextW(g_hwnd, L"DLSS 5 NR Player - Open a video");
     Log("view: %s", !g_nr_available ? "Original (DLSS 5 unavailable)" :
          (g_side ? "Original | DLSS 5" : (g_nr_enabled ? "DLSS 5 ON" : "DLSS 5 OFF - Original")));
@@ -1410,6 +1412,13 @@ static void LayoutControls(HWND hwnd)
             SetWindowPos(placements[i].window, nullptr,
                 placements[i].x, placements[i].y, placements[i].width, placements[i].height,
                 SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(g_video_hwnd, HWND_BOTTOM, video.left, video.top,
+        video.right - video.left, video.bottom - video.top,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(g_trackbar, HWND_TOP, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(g_volume_slider, HWND_TOP, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
@@ -1632,7 +1641,7 @@ static bool SetupWindow(UINT w, UINT h)
     DragAcceptFiles(g_hwnd, TRUE);
 
     DWORD buttonStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW;
-    g_video_hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_CENTER | SS_CENTERIMAGE,
+    g_video_hwnd = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | SS_NOTIFY | SS_CENTER | SS_CENTERIMAGE,
                                   0, 0, dw, h, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_pause_button = CreateWindowExW(0, L"BUTTON", L"Pause", buttonStyle,
                                     0, 0, 72, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
@@ -1657,14 +1666,14 @@ static bool SetupWindow(UINT w, UINT h)
                                          0, 0, 88, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_mute_button = CreateWindowExW(0, L"BUTTON", L"Mute", toggleStyle,
                                    0, 0, 70, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_volume_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Volume", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
+    g_volume_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Volume", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
                                      0, 0, 116, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     SendMessageW(g_volume_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
     SendMessageW(g_volume_slider, TBM_SETPAGESIZE, 0, 10);
     SendMessageW(g_volume_slider, TBM_SETPOS, TRUE, g_volume);
     UpdateVolumeControls();
     // seek bar (child trackbar at the bottom)
-    g_trackbar = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
+    g_trackbar = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TBS_HORZ | TBS_NOTICKS,
                                  0, h, dw, TBH, g_hwnd, nullptr, wc.hInstance, nullptr);
 
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
@@ -1715,6 +1724,8 @@ static bool SetupWindow(UINT w, UINT h)
     if (FAILED(g_factory2->CreateSwapChainForHwnd(g_queue.Get(), g_video_hwnd, &sd, nullptr, nullptr, &sc1)))
         { Log("FAIL: CreateSwapChainForHwnd"); return false; }
     sc1.As(&g_swap);
+    ApplyTheme(g_dark_theme);
+    LayoutControls(g_hwnd);
     UpdateModeTitle();
     ShowWindow(g_hwnd, SW_SHOW);
     return true;
