@@ -224,6 +224,11 @@ static HWAVEOUT g_wave_out = nullptr;
 static int g_volume = 100;
 static bool g_muted = false;
 static bool g_fullscreen = false;
+static float g_video_zoom = 1.0f;
+static int g_video_pan_x = 0, g_video_pan_y = 0;
+static int g_zoom_wheel_remainder = 0;
+static bool g_video_panning = false;
+static POINT g_video_pan_anchor = {};
 static DWORD g_windowed_style = 0;
 static WINDOWPLACEMENT g_windowed_placement = {sizeof(WINDOWPLACEMENT)};
 static HMENU g_windowed_menu = nullptr;
@@ -1102,7 +1107,7 @@ static void UpdateModeTitle()
                          g_view_mode == ViewMode::Wipe ?
                              (g_nr_enabled ? L"Wipe (DLSS 5 ON)" : L"Wipe (DLSS 5 OFF)") :
                          g_nr_enabled ? L"DLSS 5 ON" : L"DLSS 5 OFF - Original";
-    std::wstring title = L"DLSS 5 NR Player  —  ";
+    std::wstring title = L"DLSS 5 NR Player - ";
     title += mode;
     SetWindowTextW(g_hwnd, title.c_str());
     SetWindowTextW(g_view_mode_label, L"View mode:");
@@ -1428,6 +1433,28 @@ static RECT FitVideoRect(int areaWidth, int areaHeight, UINT contentWidth, UINT 
     return result;
 }
 
+static RECT TransformVideoRect(const RECT &fitted)
+{
+    int baseWidth = std::max(1L, fitted.right - fitted.left);
+    int baseHeight = std::max(1L, fitted.bottom - fitted.top);
+    int scaledWidth = std::max(1, (int)(baseWidth * g_video_zoom + 0.5f));
+    int scaledHeight = std::max(1, (int)(baseHeight * g_video_zoom + 0.5f));
+    int maxPanX = std::max(0, (scaledWidth - baseWidth) / 2);
+    int maxPanY = std::max(0, (scaledHeight - baseHeight) / 2);
+    g_video_pan_x = std::max(-maxPanX, std::min(maxPanX, g_video_pan_x));
+    g_video_pan_y = std::max(-maxPanY, std::min(maxPanY, g_video_pan_y));
+
+    int centerX = (fitted.left + fitted.right) / 2 + g_video_pan_x;
+    int centerY = (fitted.top + fitted.bottom) / 2 + g_video_pan_y;
+    RECT transformed = {
+        centerX - scaledWidth / 2,
+        centerY - scaledHeight / 2,
+        centerX - scaledWidth / 2 + scaledWidth,
+        centerY - scaledHeight / 2 + scaledHeight
+    };
+    return transformed;
+}
+
 static void UpdateWipeBarLayout()
 {
     if (!g_wipe_bar || !g_video_hwnd) return;
@@ -1515,12 +1542,47 @@ static LRESULT CALLBACK WipeBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM l
     return DefSubclassProc(hwnd, message, wp, lp);
 }
 
+static void ZoomVideoAtScreenPoint(short wheelDelta, POINT cursor)
+{
+    g_zoom_wheel_remainder += wheelDelta;
+    int steps = g_zoom_wheel_remainder / WHEEL_DELTA;
+    g_zoom_wheel_remainder %= WHEEL_DELTA;
+    float oldZoom = g_video_zoom;
+    while (steps > 0) { g_video_zoom *= 1.1f; --steps; }
+    while (steps < 0) { g_video_zoom /= 1.1f; ++steps; }
+    g_video_zoom = std::max(1.0f, std::min(8.0f, g_video_zoom));
+    if (g_video_zoom != oldZoom) {
+        RECT current = {};
+        GetWindowRect(g_video_hwnd, &current);
+        float scale = g_video_zoom / oldZoom;
+        int centerX = (current.left + current.right) / 2;
+        int centerY = (current.top + current.bottom) / 2;
+        g_video_pan_x += (int)((1.0f - scale) * (cursor.x - centerX));
+        g_video_pan_y += (int)((1.0f - scale) * (cursor.y - centerY));
+    }
+    if (g_video_zoom <= 1.0001f) {
+        g_video_zoom = 1.0f;
+        g_video_pan_x = g_video_pan_y = 0;
+    }
+    LayoutControls(g_hwnd);
+}
+
 static LRESULT CALLBACK VideoSurfaceProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
                                          UINT_PTR id, DWORD_PTR)
 {
     switch (message) {
+    case WM_MOUSEWHEEL:
+    {
+        POINT cursor = {(short)LOWORD(lp), (short)HIWORD(lp)};
+        ZoomVideoAtScreenPoint(GET_WHEEL_DELTA_WPARAM(wp), cursor);
+        return 0;
+    }
     case WM_SETCURSOR:
     {
+        if (g_video_panning) {
+            SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_SIZEALL));
+            return TRUE;
+        }
         POINT point = {};
         GetCursorPos(&point);
         ScreenToClient(hwnd, &point);
@@ -1538,12 +1600,38 @@ static LRESULT CALLBACK VideoSurfaceProc(HWND hwnd, UINT message, WPARAM wp, LPA
             return 0;
         }
         break;
+    case WM_MBUTTONDOWN:
+        g_video_panning = true;
+        GetCursorPos(&g_video_pan_anchor);
+        SetCapture(hwnd);
+        SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_SIZEALL));
+        return 0;
     case WM_MOUSEMOVE:
+        if (GetCapture() == hwnd && g_video_panning) {
+            POINT point = {};
+            GetCursorPos(&point);
+            g_video_pan_x += point.x - g_video_pan_anchor.x;
+            g_video_pan_y += point.y - g_video_pan_anchor.y;
+            g_video_pan_anchor = point;
+            LayoutControls(g_hwnd);
+            SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_SIZEALL));
+            return 0;
+        }
         if (GetCapture() == hwnd) {
             SetWipePositionFromMouse(hwnd, lp);
             SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_SIZEWE));
             return 0;
         }
+        break;
+    case WM_MBUTTONUP:
+        if (GetCapture() == hwnd && g_video_panning) {
+            g_video_panning = false;
+            ReleaseCapture();
+            return 0;
+        }
+        break;
+    case WM_CAPTURECHANGED:
+        g_video_panning = false;
         break;
     case WM_LBUTTONUP:
         if (GetCapture() == hwnd) {
@@ -1604,6 +1692,7 @@ static void LayoutControls(HWND hwnd)
         for (HWND control : chrome) if (control) ShowWindow(control, SW_HIDE);
         UINT contentWidth = g_vid_w * (IsSplitView() ? 2u : 1u);
         RECT video = FitVideoRect(width, height, contentWidth, g_vid_h);
+        video = TransformVideoRect(video);
         SetWindowPos(g_video_hwnd, nullptr, video.left, video.top,
             video.right - video.left, video.bottom - video.top,
             SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1627,6 +1716,7 @@ static void LayoutControls(HWND hwnd)
     UINT contentWidth = g_media_loaded ? g_vid_w * (IsSplitView() ? 2u : 1u) : 0;
     UINT contentHeight = g_media_loaded ? g_vid_h : 0;
     RECT video = FitVideoRect(width, videoHeight, contentWidth, contentHeight);
+    if (g_media_loaded) video = TransformVideoRect(video);
     struct Placement { HWND window; int x, y, width, height; };
     Placement placements[20];
     int count = 0;
@@ -1809,6 +1899,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
              ((NMHDR *)lp)->hwndFrom == g_trackbar))
             return DrawModernTrackbar((NMCUSTOMDRAW *)lp);
         break;
+    case WM_MOUSEWHEEL:
+    {
+        POINT cursor = {(short)LOWORD(lp), (short)HIWORD(lp)};
+        HWND hit = WindowFromPoint(cursor);
+        if (hit == g_video_hwnd || hit == g_wipe_bar ||
+            (g_video_hwnd && hit && IsChild(g_video_hwnd, hit))) {
+            ZoomVideoAtScreenPoint(GET_WHEEL_DELTA_WPARAM(wp), cursor);
+            return 0;
+        }
+        break;
+    }
     case WM_SIZE: LayoutControls(hwnd); return 0;
     case WM_GETMINMAXINFO:
         ((MINMAXINFO *)lp)->ptMinTrackSize = {1150, 700}; return 0;
@@ -2875,6 +2976,8 @@ static void CleanupPlayback()
     g_frame_slot = g_last_slot = 0; g_sync_value = g_frame_index = 0;
     g_base_time = g_current_time = g_duration = 0; g_seek_requested = g_dragging = false;
     g_nr_reset = true; g_refresh_view = false; g_paused = false; g_audio_done = false;
+    g_video_zoom = 1.0f; g_video_pan_x = g_video_pan_y = 0;
+    g_zoom_wheel_remainder = 0; g_video_panning = false;
     g_read_ms = g_wait_ms = g_upload_ms = 0;
     g_media_loaded = false;
     if (IsWindow(g_hwnd)) {
