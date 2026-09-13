@@ -196,6 +196,7 @@ static ComPtr<ID3D12DescriptorHeap> g_cbv_heap;
 static ComPtr<ID3D12RootSignature> g_rs;
 static ComPtr<ID3D12PipelineState> g_pso_in;   // RGBA8 -> RGBA16F
 static ComPtr<ID3D12PipelineState> g_pso_out;  // RGBA16F -> RGBA8 (R/B swap)
+static ComPtr<ID3D12PipelineState> g_pso_blend; // original/DLSS blend -> RGBA8
 
 static ComPtr<IDXGISwapChain3> g_swap;
 static HWND g_hwnd = nullptr;
@@ -203,6 +204,7 @@ static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
 static HWND g_split_button = nullptr, g_view_mode_label = nullptr;
 static HWND g_wipe_bar = nullptr;
 static HWND g_dlss_button = nullptr, g_model_button = nullptr;
+static HWND g_intensity_slider = nullptr, g_intensity_label = nullptr;
 static HWND g_passes_slider = nullptr, g_passes_label = nullptr, g_passes_edit = nullptr;
 static HWND g_multipass_checkbox = nullptr;
 static HWND g_prev_frame_button = nullptr, g_next_frame_button = nullptr;
@@ -236,7 +238,8 @@ static double g_fps = 30.0;
 static int  g_gpu_index = -1;
 static bool g_cuda_decode = false;
 static std::string g_style = "natural";
-static int  g_preset = 3, g_intensity = 1, g_tone = 1, g_structure = 1, g_skin = -1, g_mask = 0;
+static int  g_preset = 3, g_tone = 1, g_structure = 1, g_skin = -1, g_mask = 0;
+static float g_intensity = 1.0f;
 static bool g_fast = false;
 enum class ViewMode { Normal, Split, Wipe };
 static ViewMode g_view_mode = ViewMode::Normal;
@@ -423,7 +426,7 @@ static void ConfigureNRParams(NVSDK_NGX_Parameter *params, UINT w, UINT h)
     params->Set("DLSSNR.Reset", 1);
     params->Set("DLSSNR.Style", StyleValue());
     params->Set("DLSSNR.Hint.Render.Preset", g_preset);
-    params->Set("DLSSNR.Intensity", (float)g_intensity);
+    params->Set("DLSSNR.Intensity", 1.0f);
     params->Set("DLSSNR.LocalToneStrength", (float)g_tone);
     params->Set("DLSSNR.LocalStructureStrength", (float)g_structure);
     params->Set("DLSSNR.SkinStructureStrength", (float)g_skin);
@@ -500,6 +503,7 @@ static void EvaluateNRStage(NVSDK_NGX_Parameter *params, NVSDK_NGX_Handle *featu
     params->Set("DLSSNR.Output", output);
     params->Set("DLSSNR.Backbuffer", output);
     params->Set("DLSSNR.Reset", reset ? 1 : 0);
+    params->Set("DLSSNR.Intensity", 1.0f);
     NVSDK_NGX_Result re;
     if (g_nr_eval && g_shim_eval)
         re = g_shim_eval((void *)g_nr_eval, g_list.Get(), feature, params, nullptr);
@@ -652,6 +656,7 @@ static void ReleaseNGXObjects()
 static bool SetupCompute()
 {
     // root signature: 4 descriptor tables (SRV t0, SRV t1, UAV u0, UAV u1)
+    // plus one 32-bit constant (b0) used by the original/DLSS blend pass.
     D3D12_DESCRIPTOR_RANGE ranges[4] = {};
     for (int i = 0; i < 4; ++i)
     {
@@ -659,16 +664,19 @@ static bool SetupCompute()
         ranges[i].NumDescriptors = 1;
         ranges[i].BaseShaderRegister = (i < 2) ? i : (i - 2);
     }
-    D3D12_ROOT_PARAMETER rp[4] = {};
+    D3D12_ROOT_PARAMETER rp[5] = {};
     for (int i = 0; i < 4; ++i)
     {
         rp[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         rp[i].DescriptorTable.NumDescriptorRanges = 1;
         rp[i].DescriptorTable.pDescriptorRanges = &ranges[i];
     }
+    rp[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[4].Constants.ShaderRegister = 0;
+    rp[4].Constants.Num32BitValues = 1;
 
     D3D12_ROOT_SIGNATURE_DESC rsd = {};
-    rsd.NumParameters = 4; rsd.pParameters = rp;
+    rsd.NumParameters = 5; rsd.pParameters = rp;
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
     ComPtr<ID3DBlob> sig, err;
     if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)))
@@ -702,20 +710,37 @@ static bool SetupCompute()
         "  float4 c = src[id.xy];\n"
         "  dst[id.xy] = float4(c.rgb, 1.0f);\n"
         "}\n";
+    // cs3: blend the stable DLSS result with the original. Values above 1.0
+    // extrapolate the DLSS difference, preserving the requested 0..2 range.
+    const char *src3 =
+        "Texture2D<float4> nrFrame : register(t0);\n"
+        "Texture2D<float4> baseFrame : register(t1);\n"
+        "RWTexture2D<unorm float4> dst : register(u0);\n"
+        "cbuffer BlendConstants : register(b0) { float intensity; };\n"
+        "[numthreads(16,16,1)]\n"
+        "void CSMain(uint3 id : SV_DispatchThreadID) {\n"
+        "  float3 base = baseFrame[id.xy].rgb;\n"
+        "  float3 nr = nrFrame[id.xy].rgb;\n"
+        "  dst[id.xy] = float4(saturate(base + intensity * (nr - base)), 1.0f);\n"
+        "}\n";
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC ps = {};
     ps.pRootSignature = g_rs.Get();
 
-    ComPtr<ID3DBlob> b1, e1, b2, e2;
+    ComPtr<ID3DBlob> b1, e1, b2, e2, b3, e3;
     if (FAILED(D3DCompile(src1, strlen(src1), "cs0", nullptr, nullptr, "CSMain", "cs_5_0", 0, 0, &b1, &e1)))
         { Log("FAIL: compile cs0: %s", e1 ? (char *)e1->GetBufferPointer() : "?"); return false; }
     if (FAILED(D3DCompile(src2, strlen(src2), "cs2", nullptr, nullptr, "CSMain", "cs_5_0", 0, 0, &b2, &e2)))
         { Log("FAIL: compile cs2: %s", e2 ? (char *)e2->GetBufferPointer() : "?"); return false; }
+    if (FAILED(D3DCompile(src3, strlen(src3), "cs3", nullptr, nullptr, "CSMain", "cs_5_0", 0, 0, &b3, &e3)))
+        { Log("FAIL: compile cs3: %s", e3 ? (char *)e3->GetBufferPointer() : "?"); return false; }
 
     ps.CS = { b1->GetBufferPointer(), b1->GetBufferSize() };
     if (FAILED(g_dev->CreateComputePipelineState(&ps, IID_PPV_ARGS(&g_pso_in)))) return false;
     ps.CS = { b2->GetBufferPointer(), b2->GetBufferSize() };
     if (FAILED(g_dev->CreateComputePipelineState(&ps, IID_PPV_ARGS(&g_pso_out)))) return false;
+    ps.CS = { b3->GetBufferPointer(), b3->GetBufferSize() };
+    if (FAILED(g_dev->CreateComputePipelineState(&ps, IID_PPV_ARGS(&g_pso_blend)))) return false;
 
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -1041,8 +1066,9 @@ static void ApplyTheme(bool dark)
         SetWindowTheme(g_hwnd, dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
         SetMenuBackgrounds(GetMenu(g_hwnd));
     }
-    HWND themed[] = {g_volume_slider, g_trackbar};
+    HWND themed[] = {g_volume_slider, g_intensity_slider, g_trackbar};
     if (g_volume_slider) SetWindowTheme(g_volume_slider, L"Explorer", nullptr);
+    if (g_intensity_slider) SetWindowTheme(g_intensity_slider, L"Explorer", nullptr);
     if (g_trackbar) SetWindowTheme(g_trackbar, L"", L"");
     if (g_hwnd) {
         SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
@@ -1079,6 +1105,13 @@ static void UpdateModeTitle()
     SetWindowTextW(g_multipass_checkbox, !g_nr_available ? L"Multipass: N/A" : (g_multipass_enabled ? L"Multipass: ON" : L"Multipass: OFF"));
     SendMessageW(g_multipass_checkbox, BM_SETCHECK, g_multipass_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     bool nr_controls_enabled = IsNRActive();
+    if (g_intensity_label) {
+        wchar_t intensityText[32] = {};
+        if (g_nr_available) swprintf_s(intensityText, L"Intensity: %.2f", g_intensity);
+        else wcscpy_s(intensityText, L"Intensity: N/A");
+        SetWindowTextW(g_intensity_label, intensityText);
+    }
+    EnableWindow(g_intensity_slider, nr_controls_enabled);
     if (g_passes_edit) {
         if (g_nr_available)
             SetWindowTextW(g_passes_edit, std::to_wstring(g_nr_passes).c_str());
@@ -1146,6 +1179,16 @@ static void CycleModel()
     g_refresh_view = true;
     UpdateModeTitle();
     Log("DLSS 5 model: %s", g_style.c_str());
+}
+
+static void SetIntensity(float intensity)
+{
+    intensity = std::max(0.0f, std::min(2.0f, intensity));
+    if (intensity == g_intensity) return;
+    g_intensity = intensity;
+    g_refresh_view = true;
+    UpdateModeTitle();
+    Log("DLSS blend intensity: %.2f", g_intensity);
 }
 
 static void SetPasses(int passes)
@@ -1504,7 +1547,8 @@ static void LayoutControls(HWND hwnd)
     RECT r; GetClientRect(hwnd, &r);
     int width = r.right, height = r.bottom;
     HWND chrome[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
-        g_split_button, g_view_mode_label, g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
+        g_split_button, g_view_mode_label, g_intensity_label, g_intensity_slider,
+        g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
         g_fullscreen_button, g_mute_button, g_volume_slider, g_trackbar};
     if (g_fullscreen) {
         for (HWND control : chrome) if (control) ShowWindow(control, SW_HIDE);
@@ -1547,11 +1591,19 @@ static void LayoutControls(HWND hwnd)
     placements[count++] = {g_volume_slider, audioX + muteWidth + 6,
         videoHeight + topRowY, volumeSliderWidth, 34};
     placements[count++] = {g_fullscreen_button, fullscreenX, videoHeight + topRowY, fullscreenWidth, 34};
-    placements[count++] = {g_dlss_button, bottomX, videoHeight + bottomRowY, 100, 34};
-    placements[count++] = {g_model_button, bottomX + 100 + 6, videoHeight + bottomRowY, 130, 34};
-    placements[count++] = {g_multipass_checkbox, bottomX + 100 + 6 + 130 + 6,
+    const int dlssX = bottomX;
+    placements[count++] = {g_dlss_button, dlssX, videoHeight + bottomRowY, 100, 34};
+    const int intensityLabelWidth = 98, intensitySliderWidth = 100;
+    const int intensityX = dlssX + 100 + 6;
+    placements[count++] = {g_intensity_label, intensityX,
+        videoHeight + bottomRowY + 6, intensityLabelWidth, 22};
+    placements[count++] = {g_intensity_slider, intensityX + intensityLabelWidth + 4,
+        videoHeight + bottomRowY + 2, intensitySliderWidth, 30};
+    const int modelX = intensityX + intensityLabelWidth + 4 + intensitySliderWidth + 6;
+    placements[count++] = {g_model_button, modelX, videoHeight + bottomRowY, 130, 34};
+    placements[count++] = {g_multipass_checkbox, modelX + 130 + 6,
         videoHeight + bottomRowY, 110, 34};
-    placements[count++] = {g_passes_edit, bottomX + 100 + 6 + 130 + 6 + 110 + 6,
+    placements[count++] = {g_passes_edit, modelX + 130 + 6 + 110 + 6,
         videoHeight + bottomRowY + 3, passesEntryWidth, 28};
     const int viewModeButtonWidth = 90, viewModeLabelWidth = 78;
     const int viewModeX = width - rightMargin - viewModeButtonWidth;
@@ -1688,7 +1740,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         break;
     case WM_NOTIFY:
         if (((NMHDR *)lp)->code == NM_CUSTOMDRAW &&
-            (((NMHDR *)lp)->hwndFrom == g_volume_slider || ((NMHDR *)lp)->hwndFrom == g_trackbar))
+            (((NMHDR *)lp)->hwndFrom == g_volume_slider ||
+             ((NMHDR *)lp)->hwndFrom == g_intensity_slider ||
+             ((NMHDR *)lp)->hwndFrom == g_trackbar))
             return DrawModernTrackbar((NMCUSTOMDRAW *)lp);
         break;
     case WM_SIZE: LayoutControls(hwnd); return 0;
@@ -1730,6 +1784,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_HSCROLL:
+        if ((HWND)lp == g_intensity_slider) {
+            SetIntensity((float)SendMessageW(g_intensity_slider, TBM_GETPOS, 0, 0) / 100.0f);
+            return 0;
+        }
         if ((HWND)lp == g_volume_slider) {
             SetVolume((int)SendMessageW(g_volume_slider, TBM_GETPOS, 0, 0));
             return 0;
@@ -1817,6 +1875,17 @@ static bool SetupWindow(UINT w, UINT h)
                                     0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_view_mode_label = CreateWindowExW(0, L"STATIC", L"View mode:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                                        0, 0, 78, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_intensity_label = CreateWindowExW(0, L"STATIC", L"Intensity: 1.00", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+                                       0, 0, 98, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_intensity_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Intensity",
+                                        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
+                                        0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    if (g_intensity_slider) {
+        SendMessageW(g_intensity_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
+        SendMessageW(g_intensity_slider, TBM_SETPAGESIZE, 0, 10);
+        int intensityPosition = (int)(std::max(0.0f, std::min(2.0f, g_intensity)) * 100.0f + 0.5f);
+        SendMessageW(g_intensity_slider, TBM_SETPOS, TRUE, intensityPosition);
+    }
     g_dlss_button = CreateWindowExW(0, L"BUTTON", L"DLSS 5: ON", toggleStyle,
                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_model_button = CreateWindowExW(0, L"BUTTON", L"Model: Natural", buttonStyle,
@@ -1841,13 +1910,15 @@ static bool SetupWindow(UINT w, UINT h)
 
     if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
     if (!g_video_hwnd || !g_wipe_bar || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
-        !g_split_button || !g_view_mode_label || !g_dlss_button || !g_model_button || !g_multipass_checkbox ||
+        !g_split_button || !g_view_mode_label || !g_intensity_label || !g_intensity_slider ||
+        !g_dlss_button || !g_model_button || !g_multipass_checkbox ||
         !g_passes_edit || !g_trackbar ||
         !g_mute_button || !g_volume_slider || !g_fullscreen_button) {
         return false;
     }
     HWND controls[] = {g_video_hwnd, g_pause_button, g_prev_frame_button, g_next_frame_button,
-        g_split_button, g_view_mode_label, g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
+        g_split_button, g_view_mode_label, g_intensity_label, g_intensity_slider,
+        g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
         g_fullscreen_button, g_mute_button, g_volume_slider, g_trackbar};
     for (HWND control : controls) SendMessageW(control, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
     HWND buttons[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
@@ -2257,7 +2328,7 @@ static void RenderFrame(const uint8_t *nv12)
         }
     }
 
-    // nr_out: UAV -> NPSR (cs2 reads); stage/orig: COMMON -> UAV (cs2 writes)
+    // nr_out: UAV -> NPSR; stage/orig: COMMON -> UAV for conversion/compositing.
     nb = 0;
     bars[nb++] = Trans(g_nr_out.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     bars[nb++] = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2265,15 +2336,28 @@ static void RenderFrame(const uint8_t *nv12)
         bars[nb++] = Trans(g_orig_rgba.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g_list->ResourceBarrier(nb, bars);
 
-    // cs2: NR output -> stage (right side)
-    g_list->SetPipelineState(g_pso_out.Get());
-    g_list->SetComputeRootDescriptorTable(0, { h0.ptr + (useNR ? 3 : 5) * inc }); // NR output or original input
-    g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 4 * inc });      // stage UAV
+    // Produce the displayed frame. DLSS always evaluates at its stable native
+    // intensity; this pass blends the original and DLSS frames without altering
+    // temporal NR state. 0 = original, 1 = DLSS, 2 = twice the DLSS difference.
+    if (useNR) {
+        UINT intensityBits = 0;
+        memcpy(&intensityBits, &g_intensity, sizeof(intensityBits));
+        g_list->SetPipelineState(g_pso_blend.Get());
+        g_list->SetComputeRootDescriptorTable(0, { h0.ptr + 3 * inc }); // NR output
+        g_list->SetComputeRootDescriptorTable(1, { h0.ptr + 5 * inc }); // original input
+        g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 4 * inc }); // stage UAV
+        g_list->SetComputeRoot32BitConstant(4, intensityBits, 0);
+    } else {
+        g_list->SetPipelineState(g_pso_out.Get());
+        g_list->SetComputeRootDescriptorTable(0, { h0.ptr + 5 * inc }); // original input
+        g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 4 * inc }); // stage UAV
+    }
     g_list->Dispatch((g_vid_w + 15) / 16, (g_vid_h + 15) / 16, 1);
 
     // cs2: NR input (original) -> orig for split and wipe comparisons
     if (IsComparisonView())
     {
+        g_list->SetPipelineState(g_pso_out.Get());
         g_list->SetComputeRootDescriptorTable(0, { h0.ptr + 5 * inc });  // nr_in SRV
         g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 6 * inc });  // orig UAV
         g_list->Dispatch((g_vid_w + 15) / 16, (g_vid_h + 15) / 16, 1);
@@ -2678,7 +2762,7 @@ static void CleanupPlayback()
     ReleaseNGXObjects();
     Log("cleanup: resources");
     g_swap.Reset(); g_readback.Reset();
-    g_pso_in.Reset(); g_pso_out.Reset(); g_rs.Reset(); g_cbv_heap.Reset();
+    g_pso_in.Reset(); g_pso_out.Reset(); g_pso_blend.Reset(); g_rs.Reset(); g_cbv_heap.Reset();
     g_y_tex.Reset(); g_uv_tex.Reset(); g_staging.Reset(); g_nr_in.Reset();
     g_nr_out.Reset(); g_nr_mid.clear();
     g_stage_rgba.Reset(); g_orig_rgba.Reset(); g_list.Reset();
@@ -2712,7 +2796,8 @@ int wmain(int argc, wchar_t **argv)
         if (a == L"--gpu" && i + 1 < argc) g_gpu_index = _wtoi(argv[++i]);
         else if (a == L"--style" && i + 1 < argc) { char b[64]; WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, b, 64, nullptr, nullptr); g_style = b; }
         else if (a == L"--preset" && i + 1 < argc) g_preset = _wtoi(argv[++i]);
-        else if (a == L"--intensity" && i + 1 < argc) g_intensity = _wtoi(argv[++i]);
+        else if (a == L"--intensity" && i + 1 < argc)
+            g_intensity = std::max(0.0f, std::min(2.0f, (float)_wtof(argv[++i])));
         else if (a == L"--tone" && i + 1 < argc) g_tone = _wtoi(argv[++i]);
         else if (a == L"--structure" && i + 1 < argc) g_structure = _wtoi(argv[++i]);
         else if (a == L"--skin" && i + 1 < argc) g_skin = _wtoi(argv[++i]);
