@@ -27,7 +27,7 @@ int main()
     assert(g_ui_font);
     assert((GetWindowLongPtrW(g_pause_button, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW);
     assert(g_volume == 100 && !g_muted);
-    SendMessageW(g_volume_slider, TBM_SETPOS, TRUE, 35);
+    SliderSetPos(g_volume_slider, 35);
     WndProc(g_hwnd, WM_HSCROLL, TB_THUMBTRACK, (LPARAM)g_volume_slider);
     assert(g_volume == 35 && !g_seek_requested);
     WndProc(g_hwnd, WM_COMMAND, MAKEWPARAM(0, BN_CLICKED), (LPARAM)g_mute_button);

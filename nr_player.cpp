@@ -817,6 +817,207 @@ static ThemeColors CurrentThemeColors()
         RGB(51, 94, 234), RGB(67, 108, 241)};
 }
 
+static const wchar_t MODERN_SLIDER_CLASS[] = L"NRModernSlider";
+
+struct ModernSliderState
+{
+    int minimum, maximum, value, page;
+    bool dragging;
+};
+
+static ModernSliderState *GetSliderState(HWND hwnd)
+{
+    return (ModernSliderState *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+}
+
+static bool IsModernSlider(HWND hwnd)
+{
+    wchar_t className[32] = {};
+    return hwnd && GetClassNameW(hwnd, className, ARRAYSIZE(className)) &&
+        wcscmp(className, MODERN_SLIDER_CLASS) == 0;
+}
+
+static int SliderValueFromX(HWND hwnd, int x)
+{
+    ModernSliderState *state = GetSliderState(hwnd);
+    if (!state) return 0;
+    RECT client = {};
+    GetClientRect(hwnd, &client);
+    const int margin = 8;
+    int span = std::max(1, (int)(client.right - client.left) - margin * 2);
+    int clampedX = std::max(margin, std::min((int)client.right - margin, x));
+    double t = (double)(clampedX - margin) / span;
+    return state->minimum + (int)(t * (state->maximum - state->minimum) + 0.5);
+}
+
+static void SliderNotify(HWND hwnd, WORD code)
+{
+    ModernSliderState *state = GetSliderState(hwnd);
+    if (state) SendMessageW(GetParent(hwnd), WM_HSCROLL,
+        MAKEWPARAM(code, state->value), (LPARAM)hwnd);
+}
+
+static void SliderSetPos(HWND hwnd, int value)
+{
+    ModernSliderState *state = GetSliderState(hwnd);
+    if (!state) return;
+    value = std::max(state->minimum, std::min(state->maximum, value));
+    if (value != state->value) {
+        state->value = value;
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+}
+
+static int SliderGetPos(HWND hwnd)
+{
+    ModernSliderState *state = GetSliderState(hwnd);
+    return state ? state->value : 0;
+}
+
+static void SliderSetFromMouse(HWND hwnd, LPARAM lp, WORD notification)
+{
+    SliderSetPos(hwnd, SliderValueFromX(hwnd, (short)LOWORD(lp)));
+    SliderNotify(hwnd, notification);
+}
+
+static LRESULT CALLBACK ModernSliderProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp)
+{
+    ModernSliderState *state = GetSliderState(hwnd);
+    switch (message) {
+    case WM_NCCREATE:
+    {
+        CREATESTRUCTW *create = (CREATESTRUCTW *)lp;
+        ModernSliderState *initial = (ModernSliderState *)create->lpCreateParams;
+        state = new ModernSliderState(*initial);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)state);
+        return TRUE;
+    }
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint = {};
+        HDC dc = BeginPaint(hwnd, &paint);
+        RECT client = {};
+        GetClientRect(hwnd, &client);
+        ThemeColors colors = CurrentThemeColors();
+        HBRUSH background = CreateSolidBrush(colors.background);
+        FillRect(dc, &client, background);
+        DeleteObject(background);
+
+        bool enabled = IsWindowEnabled(hwnd) != FALSE;
+        const int margin = 8;
+        const int centerY = (client.top + client.bottom) / 2;
+        RECT rail = {margin, centerY - 2, std::max(margin + 1, (int)client.right - margin), centerY + 3};
+        HBRUSH railBrush = CreateSolidBrush(colors.border);
+        HGDIOBJ oldBrush = SelectObject(dc, railBrush);
+        HGDIOBJ oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        RoundRect(dc, rail.left, rail.top, rail.right, rail.bottom, 5, 5);
+
+        double t = state && state->maximum > state->minimum ?
+            (double)(state->value - state->minimum) / (state->maximum - state->minimum) : 0.0;
+        int thumbX = rail.left + (int)(t * (rail.right - rail.left) + 0.5);
+        HBRUSH accent = CreateSolidBrush(enabled ? colors.accent : colors.mutedText);
+        SelectObject(dc, accent);
+        if (thumbX > rail.left)
+            RoundRect(dc, rail.left, rail.top, thumbX, rail.bottom, 5, 5);
+        Ellipse(dc, thumbX - 6, centerY - 6, thumbX + 7, centerY + 7);
+        SelectObject(dc, oldPen);
+        SelectObject(dc, oldBrush);
+        DeleteObject(accent);
+        DeleteObject(railBrush);
+        if (GetFocus() == hwnd) {
+            RECT focus = client;
+            InflateRect(&focus, -1, -1);
+            DrawFocusRect(dc, &focus);
+        }
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_LBUTTONDOWN:
+        if (state && IsWindowEnabled(hwnd)) {
+            SetFocus(hwnd);
+            state->dragging = true;
+            SetCapture(hwnd);
+            SliderSetFromMouse(hwnd, lp, TB_THUMBTRACK);
+        }
+        return 0;
+    case WM_MOUSEMOVE:
+        if (state && state->dragging && GetCapture() == hwnd)
+            SliderSetFromMouse(hwnd, lp, TB_THUMBTRACK);
+        return 0;
+    case WM_LBUTTONUP:
+        if (state && state->dragging) {
+            SliderSetFromMouse(hwnd, lp, TB_THUMBPOSITION);
+            state->dragging = false;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            SliderNotify(hwnd, TB_ENDTRACK);
+        }
+        return 0;
+    case WM_CAPTURECHANGED:
+        if (state && state->dragging) {
+            state->dragging = false;
+            SliderNotify(hwnd, TB_ENDTRACK);
+        }
+        return 0;
+    case WM_KEYDOWN:
+        if (state && IsWindowEnabled(hwnd)) {
+            int next = state->value;
+            if (wp == VK_LEFT || wp == VK_DOWN) --next;
+            else if (wp == VK_RIGHT || wp == VK_UP) ++next;
+            else if (wp == VK_PRIOR) next += state->page;
+            else if (wp == VK_NEXT) next -= state->page;
+            else if (wp == VK_HOME) next = state->minimum;
+            else if (wp == VK_END) next = state->maximum;
+            else break;
+            SliderSetPos(hwnd, next);
+            SliderNotify(hwnd, TB_ENDTRACK);
+            return 0;
+        }
+        break;
+    case WM_MOUSEWHEEL:
+        if (state && IsWindowEnabled(hwnd)) {
+            int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            SliderSetPos(hwnd, state->value + (delta > 0 ? 1 : -1));
+            SliderNotify(hwnd, TB_ENDTRACK);
+            return 0;
+        }
+        break;
+    case WM_ENABLE:
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+    case WM_SIZE:
+        InvalidateRect(hwnd, nullptr, FALSE);
+        break;
+    case WM_NCDESTROY:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        delete state;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, message, wp, lp);
+}
+
+static bool RegisterModernSlider(HINSTANCE instance)
+{
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = ModernSliderProc;
+    wc.hInstance = instance;
+    wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_HAND);
+    wc.lpszClassName = MODERN_SLIDER_CLASS;
+    return RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+static HWND CreateModernSlider(HWND parent, HINSTANCE instance, int minimum,
+                               int maximum, int value, int page, bool tabStop)
+{
+    ModernSliderState initial = {minimum, maximum,
+        std::max(minimum, std::min(maximum, value)), std::max(1, page), false};
+    DWORD style = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | (tabStop ? WS_TABSTOP : 0);
+    return CreateWindowExW(0, MODERN_SLIDER_CLASS, L"", style,
+        0, 0, 100, 30, parent, nullptr, instance, &initial);
+}
+
 static bool IsButtonActive(HWND button)
 {
     return (button == g_pause_button && g_paused) ||
@@ -1081,13 +1282,6 @@ static void ApplyTheme(bool dark)
         SetWindowTheme(g_hwnd, dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
         SetMenuBackgrounds(GetMenu(g_hwnd));
     }
-    HWND themed[] = {g_volume_slider, g_intensity_slider, g_tone_slider,
-        g_structure_slider, g_trackbar};
-    if (g_volume_slider) SetWindowTheme(g_volume_slider, L"Explorer", nullptr);
-    if (g_intensity_slider) SetWindowTheme(g_intensity_slider, L"Explorer", nullptr);
-    if (g_tone_slider) SetWindowTheme(g_tone_slider, L"Explorer", nullptr);
-    if (g_structure_slider) SetWindowTheme(g_structure_slider, L"Explorer", nullptr);
-    if (g_trackbar) SetWindowTheme(g_trackbar, L"", L"");
     if (g_hwnd) {
         SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
@@ -1095,8 +1289,6 @@ static void ApplyTheme(bool dark)
         DrawMenuBar(g_hwnd);
         RedrawWindow(g_hwnd, nullptr, nullptr,
             RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
-        for (HWND control : themed) if (control)
-            RedrawWindow(control, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
     }
 }
 
@@ -1363,57 +1555,9 @@ static void RequestFrameStep(int direction)
     if (g_trackbar && g_duration > 0.0)
     {
         int pos = (int)(g_seek_to / g_duration * 1000.0);
-        SendMessageW(g_trackbar, TBM_SETPOS, TRUE, pos);
+        SliderSetPos(g_trackbar, pos);
     }
     Log("frame step %s -> %.3fs", direction < 0 ? "back" : "forward", (double)g_seek_to);
-}
-
-static void SeekAtMouse(HWND hwnd, LPARAM lp, WORD notification)
-{
-    RECT channel, thumb;
-    SendMessageW(hwnd, TBM_GETCHANNELRECT, 0, (LPARAM)&channel);
-    SendMessageW(hwnd, TBM_GETTHUMBRECT, 0, (LPARAM)&thumb);
-    int x = (short)LOWORD(lp);
-    int thumbWidth = thumb.right - thumb.left;
-    int start = channel.left + thumbWidth / 2;
-    int span = std::max(1L, channel.right - channel.left - thumbWidth);
-    int pos = (int)(1000.0 * (x - start) / span + 0.5);
-    pos = std::max(0, std::min(1000, pos));
-    SendMessageW(hwnd, TBM_SETPOS, TRUE, pos);
-    SendMessageW(GetParent(hwnd), WM_HSCROLL, MAKEWPARAM(notification, pos), (LPARAM)hwnd);
-}
-
-static LRESULT CALLBACK SeekBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
-                                    UINT_PTR id, DWORD_PTR)
-{
-    switch (message)
-    {
-    case WM_LBUTTONDOWN:
-        SetFocus(hwnd);
-        SetCapture(hwnd);
-        SeekAtMouse(hwnd, lp, TB_THUMBTRACK);
-        return 0;
-    case WM_MOUSEMOVE:
-        if (GetCapture() == hwnd) { SeekAtMouse(hwnd, lp, TB_THUMBTRACK); return 0; }
-        break;
-    case WM_LBUTTONUP:
-        if (GetCapture() == hwnd) {
-            SeekAtMouse(hwnd, lp, TB_ENDTRACK);
-            ReleaseCapture();
-            return 0;
-        }
-        break;
-    case WM_CAPTURECHANGED:
-        if (g_dragging) {
-            g_dragging = false;
-            SendMessageW(GetParent(hwnd), WM_HSCROLL, TB_ENDTRACK, (LPARAM)hwnd);
-        }
-        return 0;
-    case WM_NCDESTROY:
-        RemoveWindowSubclass(hwnd, SeekBarProc, id);
-        break;
-    }
-    return DefSubclassProc(hwnd, message, wp, lp);
 }
 
 static RECT FitVideoRect(int areaWidth, int areaHeight, UINT contentWidth, UINT contentHeight)
@@ -1693,11 +1837,10 @@ static void LayoutControls(HWND hwnd)
         UINT contentWidth = g_vid_w * (IsSplitView() ? 2u : 1u);
         RECT video = FitVideoRect(width, height, contentWidth, g_vid_h);
         video = TransformVideoRect(video);
-        SetWindowPos(g_video_hwnd, nullptr, video.left, video.top,
+        SetWindowPos(g_video_hwnd, HWND_BOTTOM, video.left, video.top,
             video.right - video.left, video.bottom - video.top,
-            SWP_NOZORDER | SWP_NOACTIVATE);
+            SWP_NOACTIVATE);
         UpdateWipeBarLayout();
-        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
         return;
     }
     for (HWND control : chrome) if (control) ShowWindow(control, SW_SHOW);
@@ -1784,7 +1927,6 @@ static void LayoutControls(HWND hwnd)
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     SetWindowPos(g_volume_slider, HWND_TOP, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 static void OpenVideoDialog(HWND hwnd)
@@ -1806,37 +1948,6 @@ static void OpenVideoDialog(HWND hwnd)
 static void ShowHotkeyHelp(HWND hwnd)
 {
     MessageBoxW(hwnd, HOTKEY_HELP_TEXT, L"Keyboard Shortcuts", MB_OK | MB_ICONINFORMATION);
-}
-
-static LRESULT DrawModernTrackbar(NMCUSTOMDRAW *draw)
-{
-    ThemeColors colors = CurrentThemeColors();
-    if (draw->dwDrawStage == CDDS_PREPAINT) {
-        RECT client;
-        GetClientRect(draw->hdr.hwndFrom, &client);
-        FillRect(draw->hdc, &client, g_background_brush ? g_background_brush : GetSysColorBrush(COLOR_WINDOW));
-        return CDRF_NOTIFYITEMDRAW;
-    }
-    if (draw->dwDrawStage != CDDS_ITEMPREPAINT) return CDRF_DODEFAULT;
-    if (draw->dwItemSpec != TBCD_CHANNEL && draw->dwItemSpec != TBCD_THUMB)
-        return CDRF_SKIPDEFAULT;
-
-    RECT item = draw->rc;
-    COLORREF fill = draw->dwItemSpec == TBCD_THUMB ? colors.accent : colors.border;
-    int radius = draw->dwItemSpec == TBCD_THUMB ? 12 : 6;
-    if (draw->dwItemSpec == TBCD_CHANNEL) {
-        int center = (item.top + item.bottom) / 2;
-        item.top = center - 2;
-        item.bottom = center + 3;
-    }
-    HBRUSH brush = CreateSolidBrush(fill);
-    HGDIOBJ oldBrush = SelectObject(draw->hdc, brush);
-    HGDIOBJ oldPen = SelectObject(draw->hdc, GetStockObject(NULL_PEN));
-    RoundRect(draw->hdc, item.left, item.top, item.right, item.bottom, radius, radius);
-    SelectObject(draw->hdc, oldPen);
-    SelectObject(draw->hdc, oldBrush);
-    DeleteObject(brush);
-    return CDRF_SKIPDEFAULT;
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
@@ -1890,15 +2001,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             return TRUE;
         }
         break;
-    case WM_NOTIFY:
-        if (((NMHDR *)lp)->code == NM_CUSTOMDRAW &&
-            (((NMHDR *)lp)->hwndFrom == g_volume_slider ||
-             ((NMHDR *)lp)->hwndFrom == g_intensity_slider ||
-             ((NMHDR *)lp)->hwndFrom == g_tone_slider ||
-             ((NMHDR *)lp)->hwndFrom == g_structure_slider ||
-             ((NMHDR *)lp)->hwndFrom == g_trackbar))
-            return DrawModernTrackbar((NMCUSTOMDRAW *)lp);
-        break;
     case WM_MOUSEWHEEL:
     {
         POINT cursor = {(short)LOWORD(lp), (short)HIWORD(lp)};
@@ -1950,28 +2052,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
     }
     case WM_HSCROLL:
         if ((HWND)lp == g_intensity_slider) {
-            SetIntensity((float)SendMessageW(g_intensity_slider, TBM_GETPOS, 0, 0) / 100.0f);
+            SetIntensity((float)SliderGetPos(g_intensity_slider) / 100.0f);
             return 0;
         }
         if ((HWND)lp == g_tone_slider) {
-            SetTone((float)SendMessageW(g_tone_slider, TBM_GETPOS, 0, 0) / 100.0f);
+            SetTone((float)SliderGetPos(g_tone_slider) / 100.0f);
             WORD code = LOWORD(wp);
             if (code == TB_THUMBPOSITION || code == TB_ENDTRACK) g_nr_reset = true;
             return 0;
         }
         if ((HWND)lp == g_structure_slider) {
-            SetStructure((float)SendMessageW(g_structure_slider, TBM_GETPOS, 0, 0) / 100.0f);
+            SetStructure((float)SliderGetPos(g_structure_slider) / 100.0f);
             WORD code = LOWORD(wp);
             if (code == TB_THUMBPOSITION || code == TB_ENDTRACK) g_nr_reset = true;
             return 0;
         }
         if ((HWND)lp == g_volume_slider) {
-            SetVolume((int)SendMessageW(g_volume_slider, TBM_GETPOS, 0, 0));
+            SetVolume(SliderGetPos(g_volume_slider));
             return 0;
         }
         if ((HWND)lp == g_trackbar)
         {
-            int pos = (int)SendMessageW(g_trackbar, TBM_GETPOS, 0, 0);
+            int pos = SliderGetPos(g_trackbar);
             if (g_duration > 0) g_seek_to = (double)pos / 1000.0 * g_duration;
             WORD code = LOWORD(wp);
             bool force = (code == TB_THUMBPOSITION || code == TB_ENDTRACK);
@@ -2008,6 +2110,7 @@ static bool SetupWindow(UINT w, UINT h)
     wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassExW(&wc);
+    if (!RegisterModernSlider(wc.hInstance)) return false;
 
     DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
     RECT r = { 0, 0, (LONG)dw, (LONG)(h + TBH) };
@@ -2054,37 +2157,16 @@ static bool SetupWindow(UINT w, UINT h)
                                        0, 0, 78, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_intensity_label = CreateWindowExW(0, L"STATIC", L"Intensity: 1.00", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
                                        0, 0, 104, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_intensity_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Intensity",
-                                        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
-                                        0, 0, 70, 30, g_hwnd, nullptr, wc.hInstance, nullptr);
-    if (g_intensity_slider) {
-        SendMessageW(g_intensity_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
-        SendMessageW(g_intensity_slider, TBM_SETPAGESIZE, 0, 10);
-        int intensityPosition = (int)(std::max(0.0f, std::min(2.0f, g_intensity)) * 100.0f + 0.5f);
-        SendMessageW(g_intensity_slider, TBM_SETPOS, TRUE, intensityPosition);
-    }
+    int intensityPosition = (int)(std::max(0.0f, std::min(2.0f, g_intensity)) * 100.0f + 0.5f);
+    g_intensity_slider = CreateModernSlider(g_hwnd, wc.hInstance, 0, 200, intensityPosition, 10, true);
     g_tone_label = CreateWindowExW(0, L"STATIC", L"Tone: 1.00", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
                                   0, 0, 72, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_tone_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Tone",
-                                   WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
-                                   0, 0, 70, 30, g_hwnd, nullptr, wc.hInstance, nullptr);
-    if (g_tone_slider) {
-        SendMessageW(g_tone_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
-        SendMessageW(g_tone_slider, TBM_SETPAGESIZE, 0, 10);
-        int tonePosition = (int)(std::max(0.0f, std::min(2.0f, g_tone)) * 100.0f + 0.5f);
-        SendMessageW(g_tone_slider, TBM_SETPOS, TRUE, tonePosition);
-    }
+    int tonePosition = (int)(std::max(0.0f, std::min(2.0f, g_tone)) * 100.0f + 0.5f);
+    g_tone_slider = CreateModernSlider(g_hwnd, wc.hInstance, 0, 200, tonePosition, 10, true);
     g_structure_label = CreateWindowExW(0, L"STATIC", L"Structure: 1.00", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
                                        0, 0, 100, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_structure_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Structure",
-                                        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
-                                        0, 0, 70, 30, g_hwnd, nullptr, wc.hInstance, nullptr);
-    if (g_structure_slider) {
-        SendMessageW(g_structure_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 200));
-        SendMessageW(g_structure_slider, TBM_SETPAGESIZE, 0, 10);
-        int structurePosition = (int)(std::max(0.0f, std::min(2.0f, g_structure)) * 100.0f + 0.5f);
-        SendMessageW(g_structure_slider, TBM_SETPOS, TRUE, structurePosition);
-    }
+    int structurePosition = (int)(std::max(0.0f, std::min(2.0f, g_structure)) * 100.0f + 0.5f);
+    g_structure_slider = CreateModernSlider(g_hwnd, wc.hInstance, 0, 200, structurePosition, 10, true);
     g_dlss_button = CreateWindowExW(0, L"BUTTON", L"DLSS 5: ON", toggleStyle,
                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_model_button = CreateWindowExW(0, L"BUTTON", L"Model: Natural", buttonStyle,
@@ -2097,17 +2179,10 @@ static bool SetupWindow(UINT w, UINT h)
                                          0, 0, 88, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_mute_button = CreateWindowExW(0, L"BUTTON", L"Mute", toggleStyle,
                                    0, 0, 70, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    g_volume_slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Volume", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
-                                     0, 0, 116, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
-    SendMessageW(g_volume_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
-    SendMessageW(g_volume_slider, TBM_SETPAGESIZE, 0, 10);
-    SendMessageW(g_volume_slider, TBM_SETPOS, TRUE, g_volume);
+    g_volume_slider = CreateModernSlider(g_hwnd, wc.hInstance, 0, 100, g_volume, 10, true);
     UpdateVolumeControls();
-    // seek bar (child trackbar at the bottom)
-    g_trackbar = CreateWindowExW(0, TRACKBAR_CLASSW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TBS_HORZ | TBS_NOTICKS,
-                                 0, h, dw, TBH, g_hwnd, nullptr, wc.hInstance, nullptr);
-
-    if (g_trackbar) SendMessageW(g_trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
+    // seek slider at the bottom
+    g_trackbar = CreateModernSlider(g_hwnd, wc.hInstance, 0, 1000, 0, 50, false);
     if (!g_video_hwnd || !g_wipe_bar || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
         !g_split_button || !g_view_mode_label || !g_intensity_label || !g_intensity_slider ||
         !g_tone_label || !g_tone_slider || !g_structure_label || !g_structure_slider ||
@@ -2128,9 +2203,6 @@ static bool SetupWindow(UINT w, UINT h)
         if (!SetWindowSubclass(button, ModernButtonProc, 2, 0)) {
             return false;
         }
-    }
-    if (!SetWindowSubclass(g_trackbar, SeekBarProc, 1, 0)) {
-        return false;
     }
     if (!SetWindowSubclass(g_wipe_bar, WipeBarProc, 3, 0)) {
         return false;
@@ -2831,7 +2903,7 @@ static int PlayVideo(const std::wstring &input)
                 if (!(msg.lParam & (1LL << 30))) TogglePause();
                 continue;
             }
-            if (msg.message == WM_KEYDOWN && msg.hwnd != g_volume_slider && msg.hwnd != g_passes_edit && (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT))
+            if (msg.message == WM_KEYDOWN && !IsModernSlider(msg.hwnd) && msg.hwnd != g_passes_edit && (msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT))
             {
                 if (!(msg.lParam & (1LL << 30))) RequestFrameStep(msg.wParam == VK_LEFT ? -1 : 1);
                 continue;
@@ -2916,7 +2988,7 @@ static int PlayVideo(const std::wstring &input)
         if (!g_dragging && g_trackbar && g_duration > 0)
         {
             int pos = (int)(g_current_time / g_duration * 1000.0);
-            SendMessageW(g_trackbar, TBM_SETPOS, TRUE, pos);
+            SliderSetPos(g_trackbar, pos);
         }
 
         if (!g_dump_path.empty() && g_frame_index == 1)
@@ -2982,7 +3054,7 @@ static void CleanupPlayback()
     g_media_loaded = false;
     if (IsWindow(g_hwnd)) {
         SetWindowTextW(g_pause_button, L"Pause");
-        SendMessageW(g_trackbar, TBM_SETPOS, TRUE, 0);
+        SliderSetPos(g_trackbar, 0);
         SetWindowTextW(g_video_hwnd, L"Drop a video here, or choose File > Open");
         InvalidateRect(g_video_hwnd, nullptr, TRUE);
         UpdateModeTitle();
@@ -3028,8 +3100,8 @@ int wmain(int argc, wchar_t **argv)
     if (input.empty()) g_gui = true;
     if (!g_output.empty() && g_fast) { Log("note: offline mode (--output) already runs full speed"); }
 
-    // common controls (trackbar + standard edit/button/static controls)
-    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES };
+    // common controls used by the standard edit/button/static controls and subclasses
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
 
     if (g_gui) {
@@ -3075,8 +3147,8 @@ int wmain(int argc, wchar_t **argv)
             if (message.wParam == 'M') { CycleModel(); continue; }
             if (message.wParam == 'P') { CyclePasses(); continue; }
             if (message.wParam == VK_F11) { ToggleFullscreen(); continue; }
-            if (message.wParam == VK_LEFT && message.hwnd != g_volume_slider && message.hwnd != g_passes_edit) { RequestFrameStep(-1); continue; }
-            if (message.wParam == VK_RIGHT && message.hwnd != g_volume_slider && message.hwnd != g_passes_edit) { RequestFrameStep(1); continue; }
+            if (message.wParam == VK_LEFT && !IsModernSlider(message.hwnd) && message.hwnd != g_passes_edit) { RequestFrameStep(-1); continue; }
+            if (message.wParam == VK_RIGHT && !IsModernSlider(message.hwnd) && message.hwnd != g_passes_edit) { RequestFrameStep(1); continue; }
             if (message.wParam == VK_ESCAPE && g_fullscreen) { ToggleFullscreen(); continue; }
         }
         TranslateMessage(&message); DispatchMessageW(&message);
