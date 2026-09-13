@@ -237,7 +237,7 @@ static std::string g_style = "natural";
 static int  g_preset = 3, g_intensity = 1, g_tone = 1, g_structure = 1, g_skin = -1, g_mask = 0;
 static bool g_fast = false;
 static bool g_side = false;  // default: single DLSS 5 view
-static bool g_nr_enabled = true;
+static bool g_nr_enabled = false;
 static bool g_nr_reset = true;
 static bool g_refresh_view = false;
 static UINT64 g_frame_index = 0;
@@ -1053,17 +1053,18 @@ static void UpdateModeTitle()
     SetWindowTextW(g_model_button, modelText.c_str());
     SetWindowTextW(g_multipass_checkbox, !g_nr_available ? L"Multipass: N/A" : (g_multipass_enabled ? L"Multipass: ON" : L"Multipass: OFF"));
     SendMessageW(g_multipass_checkbox, BM_SETCHECK, g_multipass_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    bool nr_controls_enabled = g_nr_available && (g_nr_enabled || g_side);
     if (g_passes_edit) {
         if (g_nr_available)
             SetWindowTextW(g_passes_edit, std::to_wstring(g_nr_passes).c_str());
         else
             SetWindowTextW(g_passes_edit, L"1");
-        EnableWindow(g_passes_edit, g_nr_available && g_multipass_enabled && g_nr_max_passes > 1);
+        EnableWindow(g_passes_edit, nr_controls_enabled && g_multipass_enabled && g_nr_max_passes > 1);
     }
-    EnableWindow(g_split_button, g_nr_available);
+    EnableWindow(g_split_button, nr_controls_enabled);
     EnableWindow(g_dlss_button, g_nr_available && !g_side);
-    EnableWindow(g_model_button, g_nr_available);
-    EnableWindow(g_multipass_checkbox, g_nr_available);
+    EnableWindow(g_model_button, nr_controls_enabled);
+    EnableWindow(g_multipass_checkbox, nr_controls_enabled);
     EnableWindow(g_pause_button, g_media_loaded);
     EnableWindow(g_prev_frame_button, g_media_loaded);
     EnableWindow(g_next_frame_button, g_media_loaded);
@@ -1076,7 +1077,7 @@ static void UpdateModeTitle()
 
 static void ToggleComparison()
 {
-    if (!g_nr_available) return;
+    if (!g_nr_available || (!g_nr_enabled && !g_side)) return;
     if (!g_swap) { g_side = !g_side; UpdateModeTitle(); return; }
     for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i)
         WaitFence(g_fence[i].Get(), g_fence_value[i]);
@@ -1103,7 +1104,7 @@ static void ToggleNR()
 
 static void CycleModel()
 {
-    if (!g_nr_available) return;
+    if (!g_nr_available || (!g_nr_enabled && !g_side)) return;
     int next = StyleValue() + 1;
     if (next < 0 || next > 2) next = 0;
     static const char *styles[] = { "default", "natural", "cinematic" };
@@ -1117,7 +1118,7 @@ static void CycleModel()
 
 static void SetPasses(int passes)
 {
-    if (!g_nr_available) return;
+    if (!g_nr_available || (!g_nr_enabled && !g_side)) return;
     passes = std::max(1, std::min(g_nr_max_passes, passes));
     if (passes == g_nr_passes) return;
     g_nr_passes = passes;
@@ -1150,6 +1151,7 @@ static void CyclePasses()
 // fastest-playback configuration); turning it on re-probes up to MAX_NR_PASSES.
 static void ToggleMultipass()
 {
+    if (!g_nr_available || (!g_nr_enabled && !g_side)) return;
     g_multipass_enabled = !g_multipass_enabled;
     Log("multipass: %s", g_multipass_enabled ? "ON" : "OFF");
 
