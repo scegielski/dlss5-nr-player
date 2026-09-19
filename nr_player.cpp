@@ -118,12 +118,17 @@ typedef NVSDK_NGX_Result (*PFN_ShimEvaluate)(void *, ID3D12GraphicsCommandList *
 typedef NVSDK_NGX_Result (*PFN_ShimRelease)(void *, NVSDK_NGX_Handle *);
 typedef NVSDK_NGX_Result (*PFN_ShimShutdown)(void *);
 typedef NVSDK_NGX_Result (*PFN_AllocateParameters)(NVSDK_NGX_Parameter **);
+typedef NVSDK_NGX_Result (*PFN_GetCapabilityParameters)(NVSDK_NGX_Parameter **);
 typedef NVSDK_NGX_Result (*PFN_D3D12CreateFeature)(ID3D12GraphicsCommandList *, int, NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **);
 typedef NVSDK_NGX_Result (*PFN_D3D12EvaluateFeature)(ID3D12GraphicsCommandList *, const NVSDK_NGX_Handle *, const NVSDK_NGX_Parameter *, void *);
 typedef NVSDK_NGX_Result (*PFN_D3D12ReleaseFeature)(NVSDK_NGX_Handle *);
 typedef NVSDK_NGX_Result (*PFN_Shutdown)(void);
 
 static const int NR_FEATURE_ID = 18;
+// RTX Video SDK 1.1.0: nvsdk_ngx_defs_vsr.h.
+static const int VSR_FEATURE_ID = 16;
+static const int VSR_QUALITY_LOW = 1, VSR_QUALITY_MEDIUM = 2,
+                 VSR_QUALITY_HIGH = 3, VSR_QUALITY_ULTRA = 4;
 static const int MAX_NR_PASSES = 11; // hard cap for the passes slider / probe loop
 static const UINT ID_FILE_OPEN = 1001;
 static const UINT ID_FILE_EXIT = 1002;
@@ -137,6 +142,10 @@ static const wchar_t HOTKEY_HELP_TEXT[] =
     L"S\tCycle view mode (Normal / Split / Wipe)\r\n"
     L"D\tToggle DLSS 5\r\n"
     L"M\tCycle DLSS 5 model\r\n"
+    L"R\tToggle Video Super Resolution\r\n"
+    L"U\tToggle Video Super Resolution (alternate)\r\n"
+    L"V\tCycle RTX Video scale (2x / 4x / 6x)\r\n"
+    L"Q\tCycle RTX Video quality (Low / Medium / High / Ultra)\r\n"
     L"P\tCycle multipass NR passes\r\n"
     L"F11\tToggle fullscreen\r\n"
     L"Esc\tExit fullscreen or close the player";
@@ -147,6 +156,7 @@ static const wchar_t HOTKEY_HELP_TEXT[] =
 static PFN_Init_Ext            g_init_ext;
 static PFN_Init_ProjectID      g_init_projectid;
 static PFN_AllocateParameters  g_alloc;
+static PFN_GetCapabilityParameters g_get_capabilities;
 static PFN_D3D12CreateFeature  g_create;
 static PFN_D3D12EvaluateFeature g_eval;
 static PFN_D3D12ReleaseFeature g_release;
@@ -178,7 +188,11 @@ static UINT64                           g_sync_value = 0;
 // cascade stages applied first: N passes runs stage[N-1] -> ... -> stage[1] -> stage[0].
 static std::vector<NVSDK_NGX_Parameter *> g_nr_params;
 static std::vector<NVSDK_NGX_Handle *>    g_nr_features;
+static NVSDK_NGX_Parameter *g_vsr_params = nullptr;
+static NVSDK_NGX_Handle *g_vsr_feature = nullptr;
 static bool                 g_ngx_initialized = false;
+static bool                 g_vsr_available = false;
+static bool                 g_vsr_enabled = false;
 static int                  g_nr_passes = 1;      // user-selected pass count (1..g_nr_max_passes)
 static int                  g_nr_max_passes = 1;  // highest pass count this session actually supports
 static bool                 g_multipass_enabled = false; // off by default: keeps startup/eval cost at the original single-pass baseline
@@ -191,12 +205,17 @@ static ComPtr<ID3D12Resource> g_nr_out;      // R16G16B16A16_FLOAT NR output
 static std::vector<ComPtr<ID3D12Resource>> g_nr_mid; // MAX_NR_PASSES-1 cascade intermediates, mid[k] feeds stage[k]
 static ComPtr<ID3D12Resource> g_stage_rgba;  // R8G8B8A8 NR output (cs2 UAV)
 static ComPtr<ID3D12Resource> g_orig_rgba;   // R8G8B8A8 "original" (side-by-side left)
+static ComPtr<ID3D12Resource> g_vsr_rgba;    // RTX Video VSR 2x output
+static ComPtr<ID3D12Resource> g_vsr_sharp_rgba; // optional post-VSR sharpened output
+static ComPtr<ID3D12Resource> g_orig_vsr_rgba; // original scaled to VSR output for comparison
 static ComPtr<ID3D12DescriptorHeap> g_cbv_heap;
 
 static ComPtr<ID3D12RootSignature> g_rs;
 static ComPtr<ID3D12PipelineState> g_pso_in;   // RGBA8 -> RGBA16F
 static ComPtr<ID3D12PipelineState> g_pso_out;  // RGBA16F -> RGBA8 (R/B swap)
 static ComPtr<ID3D12PipelineState> g_pso_blend; // original/DLSS blend -> RGBA8
+static ComPtr<ID3D12PipelineState> g_pso_scale; // original RGBA8 -> 2x RGBA8 for VSR comparisons
+static ComPtr<ID3D12PipelineState> g_pso_sharpen; // VSR output -> sharpened RGBA8
 
 static ComPtr<IDXGISwapChain3> g_swap;
 static HWND g_hwnd = nullptr;
@@ -204,6 +223,10 @@ static HWND g_video_hwnd = nullptr, g_pause_button = nullptr;
 static HWND g_split_button = nullptr, g_view_mode_label = nullptr;
 static HWND g_wipe_bar = nullptr;
 static HWND g_dlss_button = nullptr, g_model_button = nullptr;
+static HWND g_vsr_button = nullptr;
+static HWND g_vsr_scale_button = nullptr, g_vsr_quality_button = nullptr;
+static HWND g_vsr_sharpen_slider = nullptr, g_vsr_sharpen_label = nullptr;
+static HWND g_tooltip = nullptr;
 static HWND g_intensity_slider = nullptr, g_intensity_label = nullptr;
 static HWND g_tone_slider = nullptr, g_tone_label = nullptr;
 static HWND g_structure_slider = nullptr, g_structure_label = nullptr;
@@ -214,7 +237,7 @@ static HWND g_volume_slider = nullptr, g_mute_button = nullptr;
 static HWND g_fullscreen_button = nullptr;
 static bool g_gui = false, g_media_loaded = false;
 static std::wstring g_open_path;
-static HMODULE g_core_module = nullptr, g_nr_module = nullptr, g_caller_module = nullptr;
+static HMODULE g_core_module = nullptr, g_nr_module = nullptr, g_caller_module = nullptr, g_vsr_module = nullptr;
 static NRRuntime g_runtime = NRRuntime::Unsupported;
 static bool g_nr_available = true;
 static std::wstring g_runtime_directory;
@@ -240,6 +263,11 @@ static bool g_dark_theme = true;
 static HWND g_hover_button = nullptr;
 
 static UINT g_vid_w = 0, g_vid_h = 0;
+static int g_vsr_scale = 2, g_vsr_quality = VSR_QUALITY_MEDIUM;
+static float g_vsr_sharpen = 0.25f;
+static const wchar_t *VSRQualityName();
+static UINT FinalFrameWidth() { return g_vsr_enabled ? g_vid_w * g_vsr_scale : g_vid_w; }
+static UINT FinalFrameHeight() { return g_vsr_enabled ? g_vid_h * g_vsr_scale : g_vid_h; }
 static UINT g_row_pitch = 0;
 static double g_fps = 30.0;
 static int  g_gpu_index = -1;
@@ -267,6 +295,13 @@ static HANDLE g_audio_thread = nullptr;
 static volatile bool g_audio_done = false;
 
 static void LayoutControls(HWND hwnd);
+static void ToggleComparison();
+static void ToggleNR();
+static void CycleModel();
+static void ToggleVSR();
+static void CycleVSRScale();
+static void CycleVSRQuality();
+static void CyclePasses();
 
 static bool IsSplitView() { return g_view_mode == ViewMode::Split; }
 static bool IsComparisonView() { return g_view_mode != ViewMode::Normal; }
@@ -527,6 +562,63 @@ static void SetAllNRStyles(int style)
         if (p) p->Set("DLSSNR.Style", style);
 }
 
+// RTX Video SDK 1.1.0's NGX_D3D12_*_VSR_EXT helpers set the same generic
+// parameters below before calling CreateFeature/EvaluateFeature.  Keeping this
+// here lets the player retain its existing runtime-loaded NGX interface rather
+// than introducing a compile-time dependency on proprietary SDK headers.
+static bool CreateVSRFeature()
+{
+    if (!g_vsr_available || g_vsr_feature) return g_vsr_feature != nullptr;
+    if (!g_alloc || !g_create) return false;
+    NVSDK_NGX_Parameter *params = nullptr;
+    if (g_alloc(&params) != NGX_SUCCESS || !params) return false;
+    params->Set("CreationNodeMask", 1u);
+    params->Set("VisibilityNodeMask", 1u);
+    NVSDK_NGX_Handle *feature = nullptr;
+    NVSDK_NGX_Result result = g_create(g_list.Get(), VSR_FEATURE_ID, params, &feature);
+    if (result != NGX_SUCCESS || !feature)
+    {
+        Log("VSR CreateFeature -> 0x%08X", (unsigned)result);
+        DestroyNGXParams(params);
+        return false;
+    }
+    g_vsr_params = params;
+    g_vsr_feature = feature;
+    Log("RTX Video VSR feature created (2x, quality Medium)");
+    return true;
+}
+
+static void ReleaseVSRFeature()
+{
+    if (g_vsr_feature && g_release) g_release(g_vsr_feature);
+    g_vsr_feature = nullptr;
+    DestroyNGXParams(g_vsr_params);
+}
+
+static bool EvaluateVSR()
+{
+    if (!g_vsr_feature || !g_vsr_params) return false;
+    // Names and values match NGX_D3D12_EVALUATE_VSR_EXT in
+    // nvsdk_ngx_helpers_vsr.h (SDK 1.1.0).
+    g_vsr_params->Set("Input1", g_stage_rgba.Get());
+    g_vsr_params->Set("Output", g_vsr_rgba.Get());
+    g_vsr_params->Set("Rect.X", 0u);
+    g_vsr_params->Set("Rect.Y", 0u);
+    g_vsr_params->Set("Rect.W", g_vid_w);
+    g_vsr_params->Set("Rect.H", g_vid_h);
+    g_vsr_params->Set("OutRect.X", 0u);
+    g_vsr_params->Set("OutRect.Y", 0u);
+    g_vsr_params->Set("OutRect.W", FinalFrameWidth());
+    g_vsr_params->Set("OutRect.H", FinalFrameHeight());
+    g_vsr_params->Set("VSR.QualityLevel", g_vsr_quality);
+    NVSDK_NGX_Result result = g_eval(g_list.Get(), g_vsr_feature, g_vsr_params, nullptr);
+    if (result != NGX_SUCCESS) {
+        Log("VSR EvaluateFeature -> 0x%08X; disabling VSR", (unsigned)result);
+        return false;
+    }
+    return true;
+}
+
 static void SetAllNRFloatParameter(const char *name, float value)
 {
     for (NVSDK_NGX_Parameter *p : g_nr_params)
@@ -558,6 +650,7 @@ static bool SetupNGX(UINT w, UINT h)
     g_init_ext       = (PFN_Init_Ext)GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_Ext");
     g_init_projectid = (PFN_Init_ProjectID)GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_ProjectID");
     g_alloc          = (PFN_AllocateParameters)GetProcAddress(ngx, "NVSDK_NGX_D3D12_AllocateParameters");
+    g_get_capabilities = (PFN_GetCapabilityParameters)GetProcAddress(ngx, "NVSDK_NGX_D3D12_GetCapabilityParameters");
     g_create         = (PFN_D3D12CreateFeature)GetProcAddress(ngx, "NVSDK_NGX_D3D12_CreateFeature");
     g_eval           = (PFN_D3D12EvaluateFeature)GetProcAddress(ngx, "NVSDK_NGX_D3D12_EvaluateFeature");
     g_release        = (PFN_D3D12ReleaseFeature)GetProcAddress(ngx, "NVSDK_NGX_D3D12_ReleaseFeature");
@@ -569,6 +662,8 @@ static bool SetupNGX(UINT w, UINT h)
     std::wstring base(executable, executableLength);
     base.resize(base.find_last_of(L"\\/") + 1);
     std::wstring nrPath = base + RuntimeRelativePath(g_runtime);
+    std::wstring vsrPath = base + L"vsr\\nvngx_vsr.dll";
+    std::wstring vsrDirectory = vsrPath.substr(0, vsrPath.find_last_of(L"\\/"));
     g_runtime_directory = nrPath.substr(0, nrPath.find_last_of(L"\\/"));
     Log("NR runtime: %s (%ls)", g_runtime == NRRuntime::RTX40 ? "RTX40 community patch" : "RTX50 original", nrPath.c_str());
     HMODULE nr = g_nr_module ? g_nr_module : LoadLibraryW(nrPath.c_str());
@@ -588,27 +683,50 @@ static bool SetupNGX(UINT w, UINT h)
         g_shim_eval    = (PFN_ShimEvaluate)GetProcAddress(shim, "DLSSNR_CallEvaluate");
         g_shim_release = (PFN_ShimRelease)GetProcAddress(shim, "DLSSNR_CallRelease");
     }
-    if (!g_init_projectid || !g_alloc || !g_nr_create || !g_nr_eval || !g_nr_release)
+    if (!g_init_ext || !g_alloc || !g_nr_create || !g_nr_eval || !g_nr_release)
         { Log("FAIL: NGX entry points missing"); return false; }
 
     wchar_t data_path[MAX_PATH] = L".";
     GetCurrentDirectoryW(MAX_PATH, data_path);
     const unsigned long long APP_ID = 141959980ULL;
-    const wchar_t *path_list[2] = { g_runtime_directory.c_str(), data_path };
-    NVSDK_NGX_PathListInfo pli = {}; pli.Path = path_list; pli.Length = 2;
+    // VSR is supplied in a separate local folder so it cannot be mistaken for
+    // either NR runtime.  The SDK accepts feature lookup paths at init time.
+    const wchar_t *path_list[3] = { g_runtime_directory.c_str(), vsrDirectory.c_str(), data_path };
+    NVSDK_NGX_PathListInfo pli = {}; pli.Path = path_list; pli.Length = 3;
     NVSDK_NGX_FeatureCommonInfo fci = {};
     fci.PathListInfo = pli;
     fci.LoggingInfo.LoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
 
+    // The RTX Video SDK requires feature DLLs to be available before NGX is
+    // initialized.  Loading it now also catches a missing local runtime before
+    // the capability query below.
+    g_vsr_module = LoadLibraryW(vsrPath.c_str());
+
     int inited = 0;
     for (int ver = 0x13; ver <= 0x20 && !inited; ++ver)
     {
-        NVSDK_NGX_Result r = g_init_projectid("53f803cc-a12f-4d69-90d5-19b7599cad19",
-                                              0, "0.1", data_path, g_dev.Get(), ver, nullptr);
-        if (r == NGX_SUCCESS) { Log("core Init_ProjectID ver=0x%02X ok", ver); inited = 1; }
+        // RTX Video SDK uses the ordinary NGX application initialization.  The
+        // NR runtime is initialized separately through its existing shim below.
+        NVSDK_NGX_Result r = g_init_ext(0, data_path, g_dev.Get(), ver, &fci);
+        if (r == NGX_SUCCESS) { Log("core RTX Video Init_Ext ver=0x%02X ok", ver); inited = 1; }
     }
-    if (!inited) { Log("FAIL: Init_ProjectID"); return false; }
+    if (!inited) { Log("FAIL: RTX Video Init_Ext"); return false; }
     g_ngx_initialized = true;
+
+    if (!g_vsr_module) {
+        Log("RTX Video VSR runtime unavailable: %ls", vsrPath.c_str());
+    } else if (!g_get_capabilities) {
+        Log("RTX Video VSR unavailable: NGX capability API is missing");
+    } else {
+        NVSDK_NGX_Parameter *capabilities = nullptr;
+        NVSDK_NGX_Result capResult = g_get_capabilities(&capabilities);
+        int available = 0;
+        if (capResult == NGX_SUCCESS && capabilities)
+            capabilities->Get("VSR.Available", &available);
+        DestroyNGXParams(capabilities);
+        g_vsr_available = available != 0;
+        Log("RTX Video VSR availability: %s", g_vsr_available ? "available" : "not supported by this GPU/driver");
+    }
 
     if (g_direct_init && g_shim_init)
     {
@@ -654,6 +772,9 @@ static bool SetupNGX(UINT w, UINT h)
 
 static void ReleaseNGXObjects()
 {
+    ReleaseVSRFeature();
+    g_vsr_enabled = false;
+    g_vsr_available = false;
     for (int i = (int)g_nr_features.size() - 1; i >= 0; --i)
         ReleaseNRFeature(g_nr_features[i], g_nr_params[i]);
     g_nr_features.clear();
@@ -738,17 +859,61 @@ static bool SetupCompute()
         "  float3 nr = nrFrame[id.xy].rgb;\n"
         "  dst[id.xy] = float4(saturate(base + intensity * (nr - base)), 1.0f);\n"
         "}\n";
+    // Scale the original frame on GPU for Split/Wipe while VSR is active.
+    // This is deliberately a presentation-only path; VSR always consumes the
+    // freshly generated native-resolution stage texture.  Use bilinear rather
+    // than point sampling: the original side must be a normal scaled baseline,
+    // not an artificially pixelated comparison.
+    const char *src4 =
+        "Texture2D<float4> src : register(t0);\n"
+        "RWTexture2D<unorm float4> dst : register(u0);\n"
+        "[numthreads(16,16,1)]\n"
+        "void CSMain(uint3 id : SV_DispatchThreadID) {\n"
+        "  uint w, h; dst.GetDimensions(w, h);\n"
+        "  uint sw, sh; src.GetDimensions(sw, sh);\n"
+        "  float sx = ((id.x + 0.5f) * sw / w) - 0.5f;\n"
+        "  float sy = ((id.y + 0.5f) * sh / h) - 0.5f;\n"
+        "  int x0 = max(0, min((int)floor(sx), (int)sw - 1));\n"
+        "  int y0 = max(0, min((int)floor(sy), (int)sh - 1));\n"
+        "  int x1 = min(x0 + 1, (int)sw - 1);\n"
+        "  int y1 = min(y0 + 1, (int)sh - 1);\n"
+        "  float fx = frac(sx), fy = frac(sy);\n"
+        "  float4 top = lerp(src.Load(int3(x0, y0, 0)), src.Load(int3(x1, y0, 0)), fx);\n"
+        "  float4 bottom = lerp(src.Load(int3(x0, y1, 0)), src.Load(int3(x1, y1, 0)), fx);\n"
+        "  dst[id.xy] = lerp(top, bottom, fy);\n"
+        "}\n";
+    // Optional lightweight unsharp mask after VSR.  This is kept separate from
+    // NVIDIA's VSR evaluation so a zero slider value is exactly VSR output.
+    const char *src5 =
+        "Texture2D<float4> src : register(t0);\n"
+        "RWTexture2D<unorm float4> dst : register(u0);\n"
+        "cbuffer SharpenConstants : register(b0) { float strength; };\n"
+        "[numthreads(16,16,1)]\n"
+        "void CSMain(uint3 id : SV_DispatchThreadID) {\n"
+        "  uint w, h; dst.GetDimensions(w, h);\n"
+        "  int x = min((int)id.x, (int)w - 1), y = min((int)id.y, (int)h - 1);\n"
+        "  int xl = max(0, x - 1), xr = min((int)w - 1, x + 1);\n"
+        "  int yu = max(0, y - 1), yd = min((int)h - 1, y + 1);\n"
+        "  float4 center = src.Load(int3(x, y, 0));\n"
+        "  float3 blur = (src.Load(int3(xl, y, 0)).rgb + src.Load(int3(xr, y, 0)).rgb +\n"
+        "                 src.Load(int3(x, yu, 0)).rgb + src.Load(int3(x, yd, 0)).rgb) * 0.25f;\n"
+        "  dst[id.xy] = float4(saturate(center.rgb + strength * (center.rgb - blur)), center.a);\n"
+        "}\n";
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC ps = {};
     ps.pRootSignature = g_rs.Get();
 
-    ComPtr<ID3DBlob> b1, e1, b2, e2, b3, e3;
+    ComPtr<ID3DBlob> b1, e1, b2, e2, b3, e3, b4, e4, b5, e5;
     if (FAILED(D3DCompile(src1, strlen(src1), "cs0", nullptr, nullptr, "CSMain", "cs_5_0", 0, 0, &b1, &e1)))
         { Log("FAIL: compile cs0: %s", e1 ? (char *)e1->GetBufferPointer() : "?"); return false; }
     if (FAILED(D3DCompile(src2, strlen(src2), "cs2", nullptr, nullptr, "CSMain", "cs_5_0", 0, 0, &b2, &e2)))
         { Log("FAIL: compile cs2: %s", e2 ? (char *)e2->GetBufferPointer() : "?"); return false; }
     if (FAILED(D3DCompile(src3, strlen(src3), "cs3", nullptr, nullptr, "CSMain", "cs_5_0", 0, 0, &b3, &e3)))
         { Log("FAIL: compile cs3: %s", e3 ? (char *)e3->GetBufferPointer() : "?"); return false; }
+    if (FAILED(D3DCompile(src4, strlen(src4), "cs4", nullptr, nullptr, "CSMain", "cs_5_0", 0, 0, &b4, &e4)))
+        { Log("FAIL: compile cs4: %s", e4 ? (char *)e4->GetBufferPointer() : "?"); return false; }
+    if (FAILED(D3DCompile(src5, strlen(src5), "cs5", nullptr, nullptr, "CSMain", "cs_5_0", 0, 0, &b5, &e5)))
+        { Log("FAIL: compile cs5: %s", e5 ? (char *)e5->GetBufferPointer() : "?"); return false; }
 
     ps.CS = { b1->GetBufferPointer(), b1->GetBufferSize() };
     if (FAILED(g_dev->CreateComputePipelineState(&ps, IID_PPV_ARGS(&g_pso_in)))) return false;
@@ -756,10 +921,14 @@ static bool SetupCompute()
     if (FAILED(g_dev->CreateComputePipelineState(&ps, IID_PPV_ARGS(&g_pso_out)))) return false;
     ps.CS = { b3->GetBufferPointer(), b3->GetBufferSize() };
     if (FAILED(g_dev->CreateComputePipelineState(&ps, IID_PPV_ARGS(&g_pso_blend)))) return false;
+    ps.CS = { b4->GetBufferPointer(), b4->GetBufferSize() };
+    if (FAILED(g_dev->CreateComputePipelineState(&ps, IID_PPV_ARGS(&g_pso_scale)))) return false;
+    ps.CS = { b5->GetBufferPointer(), b5->GetBufferSize() };
+    if (FAILED(g_dev->CreateComputePipelineState(&ps, IID_PPV_ARGS(&g_pso_sharpen)))) return false;
 
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 7; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hd.NumDescriptors = 11; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_cbv_heap)))) return false;
     UINT inc = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_CPU_DESCRIPTOR_HANDLE base = g_cbv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -792,6 +961,14 @@ static bool SetupCompute()
     // [6] UAV orig (RGBA8)
     uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     g_dev->CreateUnorderedAccessView(g_orig_rgba.Get(), nullptr, &uav, { base.ptr + 6 * inc });
+    // [7] SRV original RGBA8; [8] UAV 2x original for VSR comparisons.
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    g_dev->CreateShaderResourceView(g_orig_rgba.Get(), &srv, { base.ptr + 7 * inc });
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    g_dev->CreateUnorderedAccessView(g_orig_vsr_rgba.Get(), nullptr, &uav, { base.ptr + 8 * inc });
+    // [9] SRV VSR output; [10] UAV optional post-VSR sharpened frame.
+    g_dev->CreateShaderResourceView(g_vsr_rgba.Get(), &srv, { base.ptr + 9 * inc });
+    g_dev->CreateUnorderedAccessView(g_vsr_sharp_rgba.Get(), nullptr, &uav, { base.ptr + 10 * inc });
 
     return true;
 }
@@ -835,6 +1012,34 @@ static bool IsModernSlider(HWND hwnd)
     wchar_t className[32] = {};
     return hwnd && GetClassNameW(hwnd, className, ARRAYSIZE(className)) &&
         wcscmp(className, MODERN_SLIDER_CLASS) == 0;
+}
+
+// Return true for every player shortcut, including when no video is loaded.
+// That lets focused native controls stay quiet instead of issuing a default
+// Windows beep for a non-text key.
+static bool IsPlayerHotkey(WPARAM key)
+{
+    switch (key) {
+    case 'S': case 'D': case 'M': case 'P':
+    case 'R':
+    case 'U': case 'V': case 'Q': return true;
+    default: return false;
+    }
+}
+
+static bool HandlePlayerHotkey(WPARAM key)
+{
+    switch (key) {
+    case 'S': ToggleComparison(); return true;
+    case 'D': ToggleNR(); return true;
+    case 'M': CycleModel(); return true;
+    case 'P': CyclePasses(); return true;
+    case 'R':
+    case 'U': ToggleVSR(); return true;
+    case 'V': CycleVSRScale(); return true;
+    case 'Q': CycleVSRQuality(); return true;
+    default: return false;
+    }
 }
 
 static int SliderValueFromX(HWND hwnd, int x)
@@ -961,6 +1166,10 @@ static LRESULT CALLBACK ModernSliderProc(HWND hwnd, UINT message, WPARAM wp, LPA
         }
         return 0;
     case WM_KEYDOWN:
+        if (IsPlayerHotkey(wp)) {
+            if (!(lp & (1LL << 30))) HandlePlayerHotkey(wp);
+            return 0;
+        }
         if (state && IsWindowEnabled(hwnd)) {
             int next = state->value;
             if (wp == VK_LEFT || wp == VK_DOWN) --next;
@@ -1018,11 +1227,49 @@ static HWND CreateModernSlider(HWND parent, HINSTANCE instance, int minimum,
         0, 0, 100, 30, parent, nullptr, instance, &initial);
 }
 
+static const wchar_t *HotkeyTooltipText(HWND control)
+{
+    if (control == g_pause_button) return L"Pause / resume  (Space)";
+    if (control == g_prev_frame_button) return L"Previous frame  (Left Arrow)";
+    if (control == g_next_frame_button) return L"Next frame  (Right Arrow)";
+    if (control == g_split_button) return L"Cycle view mode  (S)";
+    if (control == g_dlss_button) return L"Toggle Deep Learning Super Sampling 5  (D)";
+    if (control == g_model_button) return L"Cycle DLSS 5 model  (M)";
+    if (control == g_vsr_button) return L"Toggle Video Super Resolution  (R or U)";
+    if (control == g_vsr_scale_button) return L"Cycle VSR output scale  (V)";
+    if (control == g_vsr_quality_button) return L"Cycle VSR quality  (Q)";
+    if (control == g_multipass_checkbox) return L"Cycle multipass NR passes  (P)";
+    if (control == g_fullscreen_button) return L"Toggle fullscreen  (F11)";
+    return nullptr;
+}
+
+static void SetHotkeyTooltipVisible(HWND control, bool visible)
+{
+    if (!g_tooltip || !control) return;
+    const wchar_t *text = HotkeyTooltipText(control);
+    if (!visible || !text) { ShowWindow(g_tooltip, SW_HIDE); return; }
+    SetWindowTextW(g_tooltip, text);
+    HDC dc = GetDC(g_tooltip);
+    HFONT old = g_ui_font ? (HFONT)SelectObject(dc, g_ui_font) : nullptr;
+    SIZE size = {};
+    GetTextExtentPoint32W(dc, text, (int)wcslen(text), &size);
+    if (old) SelectObject(dc, old);
+    ReleaseDC(g_tooltip, dc);
+    POINT cursor = {};
+    GetCursorPos(&cursor);
+    SetWindowPos(g_tooltip, HWND_TOPMOST, cursor.x + 16, cursor.y + 22,
+        size.cx + 18, std::max(26L, size.cy + 10), SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
 static bool IsButtonActive(HWND button)
 {
     return (button == g_pause_button && g_paused) ||
-        (button == g_split_button && IsComparisonView()) ||
+        // The view selector represents the enhanced-output preview.  Keep it
+        // visibly active whenever either enhancement feeds that preview, even
+        // while the selector itself is set to Normal.
+        (button == g_split_button && (g_nr_enabled || g_vsr_enabled)) ||
         (button == g_dlss_button && IsNRActive()) ||
+        (button == g_vsr_button && g_vsr_enabled) ||
         (button == g_multipass_checkbox && g_multipass_enabled) ||
         (button == g_mute_button && g_muted);
 }
@@ -1248,9 +1495,11 @@ static LRESULT CALLBACK ModernButtonProc(HWND hwnd, UINT message, WPARAM wp, LPA
             TRACKMOUSEEVENT tracking = {sizeof(tracking), TME_LEAVE, hwnd, 0};
             TrackMouseEvent(&tracking);
         }
+        SetHotkeyTooltipVisible(hwnd, true);
         break;
     case WM_MOUSELEAVE:
         if (g_hover_button == hwnd) g_hover_button = nullptr;
+        SetHotkeyTooltipVisible(hwnd, false);
         InvalidateRect(hwnd, nullptr, TRUE);
         break;
     case WM_ENABLE:
@@ -1305,13 +1554,27 @@ static void UpdateModeTitle()
     SetWindowTextW(g_view_mode_label, L"View mode:");
     const wchar_t *viewText = g_view_mode == ViewMode::Split ? L"Split" :
                               g_view_mode == ViewMode::Wipe ? L"Wipe" : L"Normal";
-    SetWindowTextW(g_split_button, !g_nr_available ? L"N/A" : viewText);
+    SetWindowTextW(g_split_button, !g_media_loaded ? L"N/A" : viewText);
     SendMessageW(g_split_button, BM_SETCHECK, IsComparisonView() ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowTextW(g_dlss_button, !g_nr_available ? L"DLSS 5: N/A" : (IsNRActive() ? L"DLSS 5: ON" : L"DLSS 5: OFF"));
     SendMessageW(g_dlss_button, BM_SETCHECK, IsNRActive() ? BST_CHECKED : BST_UNCHECKED, 0);
     std::wstring modelText = g_nr_available ? L"Model: " : L"Model: N/A";
     if (g_nr_available) modelText += StyleName();
     SetWindowTextW(g_model_button, modelText.c_str());
+    SetWindowTextW(g_vsr_button, !g_vsr_available ? L"Video Super Resolution: N/A" :
+                   (g_vsr_enabled ? L"Video Super Resolution: ON" : L"Video Super Resolution: OFF"));
+    SendMessageW(g_vsr_button, BM_SETCHECK, g_vsr_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    wchar_t vsrScaleText[24], vsrQualityText[32];
+    swprintf_s(vsrScaleText, L"Scale: %dx", g_vsr_scale);
+    swprintf_s(vsrQualityText, L"Quality: %ls", VSRQualityName());
+    SetWindowTextW(g_vsr_scale_button, g_vsr_available ? vsrScaleText : L"Scale: N/A");
+    SetWindowTextW(g_vsr_quality_button, g_vsr_available ? vsrQualityText : L"Quality: N/A");
+    if (g_vsr_sharpen_label) {
+        wchar_t sharpenText[32] = {};
+        if (g_vsr_available) swprintf_s(sharpenText, L"Sharpen: %.2f", g_vsr_sharpen);
+        else wcscpy_s(sharpenText, L"Sharpen: N/A");
+        SetWindowTextW(g_vsr_sharpen_label, sharpenText);
+    }
     SetWindowTextW(g_multipass_checkbox, !g_nr_available ? L"Multipass: N/A" : (g_multipass_enabled ? L"Multipass: ON" : L"Multipass: OFF"));
     SendMessageW(g_multipass_checkbox, BM_SETCHECK, g_multipass_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     bool nr_controls_enabled = IsNRActive();
@@ -1343,9 +1606,14 @@ static void UpdateModeTitle()
             SetWindowTextW(g_passes_edit, L"1");
         EnableWindow(g_passes_edit, nr_controls_enabled && g_multipass_enabled && g_nr_max_passes > 1);
     }
-    EnableWindow(g_split_button, nr_controls_enabled);
+    EnableWindow(g_split_button, g_media_loaded &&
+                 (g_nr_enabled || g_vsr_enabled || IsComparisonView()));
     EnableWindow(g_dlss_button, g_nr_available && !IsSplitView());
     EnableWindow(g_model_button, nr_controls_enabled);
+    EnableWindow(g_vsr_button, g_vsr_available && g_media_loaded);
+    EnableWindow(g_vsr_scale_button, g_vsr_available && g_media_loaded);
+    EnableWindow(g_vsr_quality_button, g_vsr_available && g_media_loaded);
+    EnableWindow(g_vsr_sharpen_slider, g_vsr_enabled && g_media_loaded);
     EnableWindow(g_multipass_checkbox, nr_controls_enabled);
     EnableWindow(g_pause_button, g_media_loaded);
     EnableWindow(g_prev_frame_button, g_media_loaded);
@@ -1364,14 +1632,14 @@ static void UpdateModeTitle()
 
 static void ToggleComparison()
 {
-    if (!g_nr_available || (!g_nr_enabled && !IsComparisonView())) return;
+    if (!g_media_loaded || (!g_nr_enabled && !g_vsr_enabled && !IsComparisonView())) return;
     ViewMode next = g_view_mode == ViewMode::Normal ? ViewMode::Split :
                     g_view_mode == ViewMode::Split ? ViewMode::Wipe : ViewMode::Normal;
     if (!g_swap) { g_view_mode = next; UpdateModeTitle(); return; }
     for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i)
         WaitFence(g_fence[i].Get(), g_fence_value[i]);
-    HRESULT hr = g_swap->ResizeBuffers(0, next == ViewMode::Split ? g_vid_w * 2 : g_vid_w,
-                                       g_vid_h, DXGI_FORMAT_UNKNOWN, 0);
+    HRESULT hr = g_swap->ResizeBuffers(0, next == ViewMode::Split ? FinalFrameWidth() * 2 : FinalFrameWidth(),
+                                       FinalFrameHeight(), DXGI_FORMAT_UNKNOWN, 0);
     if (FAILED(hr)) { Log("FAIL: resize comparison buffers -> 0x%08X", (unsigned)hr); return; }
     g_view_mode = next;
     g_nr_reset = true;
@@ -1403,6 +1671,117 @@ static void CycleModel()
     g_refresh_view = true;
     UpdateModeTitle();
     Log("DLSS 5 model: %s", g_style.c_str());
+}
+
+static void ToggleVSR()
+{
+    if (!g_vsr_available || !g_media_loaded) return;
+    const bool sharpenSliderHadFocus = GetFocus() == g_vsr_sharpen_slider;
+    for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i)
+        WaitFence(g_fence[i].Get(), g_fence_value[i]);
+
+    bool enable = !g_vsr_enabled;
+    if (enable) {
+        g_cmd_alloc[0]->Reset();
+        g_list->Reset(g_cmd_alloc[0].Get(), nullptr);
+        if (!CreateVSRFeature()) {
+            g_list->Close();
+            Log("RTX Video VSR could not be enabled; continuing without upscaling");
+            return;
+        }
+        ExecuteAndWait();
+    } else {
+        ReleaseVSRFeature();
+    }
+    bool oldEnabled = g_vsr_enabled;
+    g_vsr_enabled = enable;
+    HRESULT hr = g_swap->ResizeBuffers(0, FinalFrameWidth() * (IsSplitView() ? 2u : 1u),
+                                       FinalFrameHeight(), DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(hr)) {
+        Log("VSR swapchain resize failed -> 0x%08X", (unsigned)hr);
+        g_vsr_enabled = oldEnabled;
+        if (enable) ReleaseVSRFeature();
+        return;
+    }
+    g_nr_reset = true;
+    g_refresh_view = true;
+    LayoutControls(g_hwnd);
+    UpdateModeTitle();
+    // Disabling VSR disables its Sharpen slider.  A disabled control cannot
+    // receive the next shortcut, so return focus to the toggle button first.
+    if (!g_vsr_enabled && sharpenSliderHadFocus && g_vsr_button)
+        SetFocus(g_vsr_button);
+    Log("RTX Video VSR: %s", g_vsr_enabled ? "enabled" : "off");
+}
+
+static const wchar_t *VSRQualityName()
+{
+    static const wchar_t *names[] = {L"?", L"Low", L"Medium", L"High", L"Ultra"};
+    return (g_vsr_quality >= VSR_QUALITY_LOW && g_vsr_quality <= VSR_QUALITY_ULTRA) ? names[g_vsr_quality] : L"Medium";
+}
+
+static bool RecreateVSROutputs()
+{
+    g_vsr_rgba.Reset(); g_vsr_sharp_rgba.Reset(); g_orig_vsr_rgba.Reset();
+    g_vsr_rgba = MakeTex(g_vid_w * g_vsr_scale, g_vid_h * g_vsr_scale, DXGI_FORMAT_R8G8B8A8_UNORM,
+                         D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    g_vsr_sharp_rgba = MakeTex(g_vid_w * g_vsr_scale, g_vid_h * g_vsr_scale, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    g_orig_vsr_rgba = MakeTex(g_vid_w * g_vsr_scale, g_vid_h * g_vsr_scale, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if (!g_vsr_rgba || !g_vsr_sharp_rgba || !g_orig_vsr_rgba) return false;
+    g_cbv_heap.Reset();
+    return SetupCompute();
+}
+
+static bool CanUseVSRScale(int scale)
+{
+    // D3D12 textures are limited to 16,384 pixels on either axis.  At 4K,
+    // 6x would be 23,040 x 12,960, so reject it before allocating three large
+    // working surfaces (VSR output, sharpened output, and comparison output).
+    return g_vid_w && g_vid_h &&
+        (UINT64)g_vid_w * scale <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION &&
+        (UINT64)g_vid_h * scale <= D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+}
+
+static void CycleVSRScale()
+{
+    if (!g_vsr_available || !g_media_loaded) return;
+    int old = g_vsr_scale;
+    const int scales[] = {2, 4, 6};
+    int next = old;
+    for (int step = 1; step <= 3; ++step) {
+        int candidate = scales[(step + (old == 2 ? 0 : old == 4 ? 1 : 2)) % 3];
+        if (CanUseVSRScale(candidate)) { next = candidate; break; }
+    }
+    if (next == old) {
+        Log("VSR scale: no larger supported output for this video");
+        return;
+    }
+    g_vsr_scale = next;
+    for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i) WaitFence(g_fence[i].Get(), g_fence_value[i]);
+    if (!RecreateVSROutputs()) { g_vsr_scale = old; RecreateVSROutputs(); Log("VSR scale allocation failed"); return; }
+    if (g_vsr_enabled && FAILED(g_swap->ResizeBuffers(0, FinalFrameWidth() * (IsSplitView() ? 2u : 1u), FinalFrameHeight(), DXGI_FORMAT_UNKNOWN, 0))) {
+        g_vsr_scale = old; RecreateVSROutputs(); Log("VSR scale swapchain resize failed"); return;
+    }
+    g_refresh_view = true; LayoutControls(g_hwnd); UpdateModeTitle();
+}
+
+static void CycleVSRQuality()
+{
+    if (!g_vsr_available) return;
+    g_vsr_quality = g_vsr_quality == VSR_QUALITY_ULTRA ? VSR_QUALITY_LOW : g_vsr_quality + 1;
+    g_refresh_view = true; UpdateModeTitle();
+}
+
+static void SetVSRSharpen(float sharpen)
+{
+    sharpen = std::max(0.0f, std::min(100.0f, sharpen));
+    if (sharpen == g_vsr_sharpen) return;
+    g_vsr_sharpen = sharpen;
+    g_refresh_view = true;
+    UpdateModeTitle();
+    Log("VSR post-sharpen strength: %.2f", g_vsr_sharpen);
 }
 
 static void SetIntensity(float intensity)
@@ -1602,7 +1981,8 @@ static RECT TransformVideoRect(const RECT &fitted)
 static void UpdateWipeBarLayout()
 {
     if (!g_wipe_bar || !g_video_hwnd) return;
-    if (g_view_mode != ViewMode::Wipe || !g_media_loaded || !g_nr_enabled) {
+    if (g_view_mode != ViewMode::Wipe || !g_media_loaded ||
+        (!g_nr_enabled && !g_vsr_enabled)) {
         ShowWindow(g_wipe_bar, SW_HIDE);
         return;
     }
@@ -1686,6 +2066,18 @@ static LRESULT CALLBACK WipeBarProc(HWND hwnd, UINT message, WPARAM wp, LPARAM l
     return DefSubclassProc(hwnd, message, wp, lp);
 }
 
+static LRESULT CALLBACK HotkeyEditProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
+                                       UINT_PTR id, DWORD_PTR)
+{
+    if (message == WM_KEYDOWN && IsPlayerHotkey(wp)) {
+        if (!(lp & (1LL << 30))) HandlePlayerHotkey(wp);
+        return 0;
+    }
+    if (message == WM_CHAR && IsPlayerHotkey(towupper((wchar_t)wp))) return 0;
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(hwnd, HotkeyEditProc, id);
+    return DefSubclassProc(hwnd, message, wp, lp);
+}
+
 static void ZoomVideoAtScreenPoint(short wheelDelta, POINT cursor)
 {
     g_zoom_wheel_remainder += wheelDelta;
@@ -1715,6 +2107,15 @@ static LRESULT CALLBACK VideoSurfaceProc(HWND hwnd, UINT message, WPARAM wp, LPA
                                          UINT_PTR id, DWORD_PTR)
 {
     switch (message) {
+    case WM_KEYDOWN:
+        if (IsPlayerHotkey(wp)) {
+            if (!(lp & (1LL << 30))) HandlePlayerHotkey(wp);
+            return 0;
+        }
+        break;
+    case WM_CHAR:
+        if (IsPlayerHotkey(towupper((wchar_t)wp))) return 0;
+        break;
     case WM_MOUSEWHEEL:
     {
         POINT cursor = {(short)LOWORD(lp), (short)HIWORD(lp)};
@@ -1830,12 +2231,12 @@ static void LayoutControls(HWND hwnd)
     HWND chrome[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
         g_split_button, g_view_mode_label, g_intensity_label, g_intensity_slider,
         g_tone_label, g_tone_slider, g_structure_label, g_structure_slider,
-        g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
+        g_dlss_button, g_model_button, g_vsr_button, g_vsr_scale_button, g_vsr_quality_button, g_vsr_sharpen_label, g_vsr_sharpen_slider, g_multipass_checkbox, g_passes_edit,
         g_fullscreen_button, g_mute_button, g_volume_slider, g_trackbar};
     if (g_fullscreen) {
         for (HWND control : chrome) if (control) ShowWindow(control, SW_HIDE);
-        UINT contentWidth = g_vid_w * (IsSplitView() ? 2u : 1u);
-        RECT video = FitVideoRect(width, height, contentWidth, g_vid_h);
+        UINT contentWidth = FinalFrameWidth() * (IsSplitView() ? 2u : 1u);
+        RECT video = FitVideoRect(width, height, contentWidth, FinalFrameHeight());
         video = TransformVideoRect(video);
         SetWindowPos(g_video_hwnd, HWND_BOTTOM, video.left, video.top,
             video.right - video.left, video.bottom - video.top,
@@ -1846,22 +2247,23 @@ static void LayoutControls(HWND hwnd)
     for (HWND control : chrome) if (control) ShowWindow(control, SW_SHOW);
     const int topRowY = 8;
     const int bottomRowY = topRowY + 42;
+    const int vsrRowY = bottomRowY + 40;
     const int transportWidth = 64 + 6 + 72 + 6 + 64;
     const int fullscreenWidth = 88;
     const int rightMargin = 8;
-    const int videoHeight = std::max(1, height - (bottomRowY + 34 + 8));
+    const int videoHeight = std::max(1, height - (vsrRowY + 34 + 8));
     const int topX = 8;
     const int seekX = topX + transportWidth + 6;
     const int fullscreenX = width - rightMargin - fullscreenWidth;
     const int audioX = fullscreenX - 6 - audioWidth;
     const int seekWidth = std::max(1, audioX - 6 - seekX);
     const int bottomX = 8;
-    UINT contentWidth = g_media_loaded ? g_vid_w * (IsSplitView() ? 2u : 1u) : 0;
-    UINT contentHeight = g_media_loaded ? g_vid_h : 0;
+    UINT contentWidth = g_media_loaded ? FinalFrameWidth() * (IsSplitView() ? 2u : 1u) : 0;
+    UINT contentHeight = g_media_loaded ? FinalFrameHeight() : 0;
     RECT video = FitVideoRect(width, videoHeight, contentWidth, contentHeight);
     if (g_media_loaded) video = TransformVideoRect(video);
     struct Placement { HWND window; int x, y, width, height; };
-    Placement placements[20];
+    Placement placements[26];
     int count = 0;
     placements[count++] = {g_video_hwnd, video.left, video.top,
         video.right - video.left, video.bottom - video.top};
@@ -1878,6 +2280,15 @@ static void LayoutControls(HWND hwnd)
     placements[count++] = {g_dlss_button, dlssX, videoHeight + bottomRowY, 100, 34};
     const int modelX = dlssX + 100 + 6;
     placements[count++] = {g_model_button, modelX, videoHeight + bottomRowY, 130, 34};
+    const int vsrX = bottomX;
+    placements[count++] = {g_vsr_button, vsrX, videoHeight + vsrRowY, 210, 34};
+    const int vsrScaleX = vsrX + 210 + 6;
+    placements[count++] = {g_vsr_scale_button, vsrScaleX, videoHeight + vsrRowY, 84, 34};
+    const int vsrQualityX = vsrScaleX + 84 + 6;
+    placements[count++] = {g_vsr_quality_button, vsrQualityX, videoHeight + vsrRowY, 116, 34};
+    const int sharpenLabelX = vsrQualityX + 116 + 10;
+    placements[count++] = {g_vsr_sharpen_label, sharpenLabelX, videoHeight + vsrRowY + 6, 96, 22};
+    placements[count++] = {g_vsr_sharpen_slider, sharpenLabelX + 96 + 4, videoHeight + vsrRowY + 2, 120, 30};
     const int intensityLabelWidth = 104, toneLabelWidth = 72, structureLabelWidth = 100;
     const int tuningSliderWidth = 70;
     const int intensityX = modelX + 130 + 6;
@@ -2027,6 +2438,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if ((HWND)lp == g_split_button && HIWORD(wp) == BN_CLICKED) { ToggleComparison(); return 0; }
         if ((HWND)lp == g_dlss_button && HIWORD(wp) == BN_CLICKED) { ToggleNR(); return 0; }
         if ((HWND)lp == g_model_button && HIWORD(wp) == BN_CLICKED) { CycleModel(); return 0; }
+        if ((HWND)lp == g_vsr_button && HIWORD(wp) == BN_CLICKED) { ToggleVSR(); return 0; }
+        if ((HWND)lp == g_vsr_scale_button && HIWORD(wp) == BN_CLICKED) { CycleVSRScale(); return 0; }
+        if ((HWND)lp == g_vsr_quality_button && HIWORD(wp) == BN_CLICKED) { CycleVSRQuality(); return 0; }
         if ((HWND)lp == g_multipass_checkbox && HIWORD(wp) == BN_CLICKED) { ToggleMultipass(); return 0; }
         if ((HWND)lp == g_passes_edit &&
             (HIWORD(wp) == EN_CHANGE || HIWORD(wp) == EN_KILLFOCUS)) return 0;
@@ -2035,6 +2449,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
         if ((HWND)lp == g_fullscreen_button && HIWORD(wp) == BN_CLICKED) { ToggleFullscreen(); return 0; }
         break;
     case WM_KEYDOWN:
+        if (IsPlayerHotkey(wp)) {
+            if (!(lp & (1LL << 30))) HandlePlayerHotkey(wp);
+            return 0;
+        }
         if (wp == VK_F11) { ToggleFullscreen(); return 0; }
         if (wp == VK_ESCAPE) {
             if (g_fullscreen) ToggleFullscreen(); else g_running = false;
@@ -2065,6 +2483,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT m, WPARAM wp, LPARAM lp)
             SetStructure((float)SliderGetPos(g_structure_slider) / 100.0f);
             WORD code = LOWORD(wp);
             if (code == TB_THUMBPOSITION || code == TB_ENDTRACK) g_nr_reset = true;
+            return 0;
+        }
+        if ((HWND)lp == g_vsr_sharpen_slider) {
+            SetVSRSharpen((float)SliderGetPos(g_vsr_sharpen_slider) / 100.0f);
             return 0;
         }
         if ((HWND)lp == g_volume_slider) {
@@ -2171,6 +2593,16 @@ static bool SetupWindow(UINT w, UINT h)
                                    0, 0, 100, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_model_button = CreateWindowExW(0, L"BUTTON", L"Model: Natural", buttonStyle,
                                     0, 0, 130, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_vsr_button = CreateWindowExW(0, L"BUTTON", L"Video Super Resolution: OFF", toggleStyle,
+                                  0, 0, 210, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_vsr_scale_button = CreateWindowExW(0, L"BUTTON", L"Scale: 2x", buttonStyle,
+                                        0, 0, 84, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_vsr_quality_button = CreateWindowExW(0, L"BUTTON", L"Quality: Medium", buttonStyle,
+                                          0, 0, 116, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_vsr_sharpen_label = CreateWindowExW(0, L"STATIC", L"Sharpen: 0.25", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE,
+                                         0, 0, 96, 22, g_hwnd, nullptr, wc.hInstance, nullptr);
+    g_vsr_sharpen_slider = CreateModernSlider(g_hwnd, wc.hInstance, 0, 10000,
+                                               (int)(g_vsr_sharpen * 100.0f + 0.5f), 100, true);
     g_multipass_checkbox = CreateWindowExW(0, L"BUTTON", L"Multipass: OFF", toggleStyle,
                                           0, 0, 110, 28, g_hwnd, nullptr, wc.hInstance, nullptr);
     g_passes_edit = CreateWindowExW(0, L"EDIT", L"1", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_CENTER,
@@ -2183,27 +2615,32 @@ static bool SetupWindow(UINT w, UINT h)
     UpdateVolumeControls();
     // seek slider at the bottom
     g_trackbar = CreateModernSlider(g_hwnd, wc.hInstance, 0, 1000, 0, 50, false);
+    g_tooltip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"STATIC", L"", WS_POPUP | WS_BORDER | SS_CENTERIMAGE,
+        0, 0, 1, 1, g_hwnd, nullptr, wc.hInstance, nullptr);
+    if (g_tooltip) SendMessageW(g_tooltip, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
     if (!g_video_hwnd || !g_wipe_bar || !g_pause_button || !g_prev_frame_button || !g_next_frame_button ||
         !g_split_button || !g_view_mode_label || !g_intensity_label || !g_intensity_slider ||
         !g_tone_label || !g_tone_slider || !g_structure_label || !g_structure_slider ||
-        !g_dlss_button || !g_model_button || !g_multipass_checkbox ||
+        !g_dlss_button || !g_model_button || !g_vsr_button || !g_vsr_scale_button || !g_vsr_quality_button || !g_vsr_sharpen_label || !g_vsr_sharpen_slider || !g_multipass_checkbox ||
         !g_passes_edit || !g_trackbar ||
-        !g_mute_button || !g_volume_slider || !g_fullscreen_button) {
+        !g_mute_button || !g_volume_slider || !g_fullscreen_button || !g_tooltip) {
         return false;
     }
     HWND controls[] = {g_video_hwnd, g_pause_button, g_prev_frame_button, g_next_frame_button,
         g_split_button, g_view_mode_label, g_intensity_label, g_intensity_slider,
         g_tone_label, g_tone_slider, g_structure_label, g_structure_slider,
-        g_dlss_button, g_model_button, g_multipass_checkbox, g_passes_edit,
+        g_dlss_button, g_model_button, g_vsr_button, g_vsr_scale_button, g_vsr_quality_button, g_vsr_sharpen_label, g_vsr_sharpen_slider, g_multipass_checkbox, g_passes_edit,
         g_fullscreen_button, g_mute_button, g_volume_slider, g_trackbar};
     for (HWND control : controls) SendMessageW(control, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
     HWND buttons[] = {g_pause_button, g_prev_frame_button, g_next_frame_button,
-        g_split_button, g_dlss_button, g_model_button, g_multipass_checkbox, g_fullscreen_button, g_mute_button};
+        g_split_button, g_dlss_button, g_model_button, g_vsr_button, g_vsr_scale_button, g_vsr_quality_button, g_multipass_checkbox, g_fullscreen_button, g_mute_button};
     for (HWND button : buttons) {
         if (!SetWindowSubclass(button, ModernButtonProc, 2, 0)) {
             return false;
         }
     }
+    if (!SetWindowSubclass(g_passes_edit, HotkeyEditProc, 5, 0)) return false;
     if (!SetWindowSubclass(g_wipe_bar, WipeBarProc, 3, 0)) {
         return false;
     }
@@ -2636,14 +3073,74 @@ static void RenderFrame(const uint8_t *nv12)
         g_list->Dispatch((g_vid_w + 15) / 16, (g_vid_h + 15) / 16, 1);
     }
 
+    ID3D12Resource *processedFrame = g_stage_rgba.Get();
+    ID3D12Resource *originalFrame = g_orig_rgba.Get();
+    bool usingVSR = false;
+    bool usingVSRSharpen = false;
+    if (g_vsr_enabled && g_vsr_feature)
+    {
+        // VSR takes the freshly produced frame as its input.  No VSR output is
+        // ever used as another VSR input, so changing views, pausing, seeking,
+        // and frame-stepping cannot create a feedback loop.
+        nb = 0;
+        bars[nb++] = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        bars[nb++] = Trans(g_vsr_rgba.Get(), D3D12_RESOURCE_STATE_COMMON,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (IsComparisonView()) {
+            bars[nb++] = Trans(g_orig_rgba.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            bars[nb++] = Trans(g_orig_vsr_rgba.Get(), D3D12_RESOURCE_STATE_COMMON,
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        g_list->ResourceBarrier(nb, bars);
+        if (!EvaluateVSR())
+        {
+            // Preserve the current frame rather than aborting playback.  The
+            // next UI refresh turns VSR off and restores the native surface.
+            g_vsr_enabled = false;
+            g_refresh_view = true;
+        }
+        else
+        {
+            usingVSR = true;
+            processedFrame = g_vsr_rgba.Get();
+            if (g_vsr_sharpen > 0.0f) {
+                D3D12_RESOURCE_BARRIER sharpenBars[2] = {
+                    Trans(g_vsr_rgba.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    Trans(g_vsr_sharp_rgba.Get(), D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+                };
+                g_list->ResourceBarrier(2, sharpenBars);
+                g_list->SetPipelineState(g_pso_sharpen.Get());
+                g_list->SetComputeRootDescriptorTable(0, { h0.ptr + 9 * inc });
+                g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 10 * inc });
+                UINT sharpenBits = 0;
+                memcpy(&sharpenBits, &g_vsr_sharpen, sizeof(sharpenBits));
+                g_list->SetComputeRoot32BitConstant(4, sharpenBits, 0);
+                g_list->Dispatch((FinalFrameWidth() + 15) / 16, (FinalFrameHeight() + 15) / 16, 1);
+                processedFrame = g_vsr_sharp_rgba.Get();
+                usingVSRSharpen = true;
+            }
+            if (IsComparisonView()) {
+                g_list->SetPipelineState(g_pso_scale.Get());
+                g_list->SetComputeRootDescriptorTable(0, { h0.ptr + 7 * inc });
+                g_list->SetComputeRootDescriptorTable(2, { h0.ptr + 8 * inc });
+                g_list->Dispatch((FinalFrameWidth() + 15) / 16, (FinalFrameHeight() + 15) / 16, 1);
+                originalFrame = g_orig_vsr_rgba.Get();
+            }
+        }
+    }
+
     // copy to backbuffer
     UINT bb = g_swap->GetCurrentBackBufferIndex();
     ComPtr<ID3D12Resource> backbuffer;
     g_swap->GetBuffer(bb, IID_PPV_ARGS(&backbuffer));
     nb = 0;
-    bars[nb++] = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    bars[nb++] = Trans(processedFrame, usingVSR ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
     if (IsComparisonView())
-        bars[nb++] = Trans(g_orig_rgba.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        bars[nb++] = Trans(originalFrame, usingVSR ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
     bars[nb++] = Trans(backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
     g_list->ResourceBarrier(nb, bars);
 
@@ -2654,38 +3151,38 @@ static void RenderFrame(const uint8_t *nv12)
     if (g_view_mode == ViewMode::Split)
     {
         D3D12_TEXTURE_COPY_LOCATION so = {};
-        so.pResource = g_orig_rgba.Get();
+        so.pResource = originalFrame;
         so.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         so.SubresourceIndex = 0;
         g_list->CopyTextureRegion(&d2, 0, 0, 0, &so, nullptr);
         D3D12_TEXTURE_COPY_LOCATION s2 = {};
-        s2.pResource = g_stage_rgba.Get();
+        s2.pResource = processedFrame;
         s2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         s2.SubresourceIndex = 0;
-        g_list->CopyTextureRegion(&d2, g_vid_w, 0, 0, &s2, nullptr);
+        g_list->CopyTextureRegion(&d2, FinalFrameWidth(), 0, 0, &s2, nullptr);
     }
     else if (g_view_mode == ViewMode::Wipe)
     {
-        UINT wipeX = std::min(g_vid_w, (UINT)(g_wipe_position * g_vid_w + 0.5f));
+        UINT wipeX = std::min(FinalFrameWidth(), (UINT)(g_wipe_position * FinalFrameWidth() + 0.5f));
         if (wipeX > 0) {
             D3D12_TEXTURE_COPY_LOCATION source = {};
-            source.pResource = g_orig_rgba.Get();
+            source.pResource = originalFrame;
             source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            D3D12_BOX box = {0, 0, 0, wipeX, g_vid_h, 1};
+            D3D12_BOX box = {0, 0, 0, wipeX, FinalFrameHeight(), 1};
             g_list->CopyTextureRegion(&d2, 0, 0, 0, &source, &box);
         }
-        if (wipeX < g_vid_w) {
+        if (wipeX < FinalFrameWidth()) {
             D3D12_TEXTURE_COPY_LOCATION source = {};
-            source.pResource = g_stage_rgba.Get();
+            source.pResource = processedFrame;
             source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            D3D12_BOX box = {wipeX, 0, 0, g_vid_w, g_vid_h, 1};
+            D3D12_BOX box = {wipeX, 0, 0, FinalFrameWidth(), FinalFrameHeight(), 1};
             g_list->CopyTextureRegion(&d2, wipeX, 0, 0, &source, &box);
         }
     }
     else
     {
         D3D12_TEXTURE_COPY_LOCATION s2 = {};
-        s2.pResource = g_stage_rgba.Get();
+        s2.pResource = processedFrame;
         s2.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         s2.SubresourceIndex = 0;
         g_list->CopyTextureRegion(&d2, 0, 0, 0, &s2, nullptr);
@@ -2699,12 +3196,12 @@ static void RenderFrame(const uint8_t *nv12)
         rd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         rd.PlacedFootprint.Offset = 0;
         rd.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        rd.PlacedFootprint.Footprint.Width = g_vid_w;
-        rd.PlacedFootprint.Footprint.Height = g_vid_h;
+        rd.PlacedFootprint.Footprint.Width = FinalFrameWidth();
+        rd.PlacedFootprint.Footprint.Height = FinalFrameHeight();
         rd.PlacedFootprint.Footprint.Depth = 1;
-        rd.PlacedFootprint.Footprint.RowPitch = (g_vid_w * 4 + 255) & ~255u;
+        rd.PlacedFootprint.Footprint.RowPitch = (FinalFrameWidth() * 4 + 255) & ~255u;
         D3D12_TEXTURE_COPY_LOCATION ss = {};
-        ss.pResource = g_stage_rgba.Get();
+        ss.pResource = processedFrame;
         ss.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         ss.SubresourceIndex = 0;
         g_list->CopyTextureRegion(&rd, 0, 0, 0, &ss, nullptr);
@@ -2713,9 +3210,16 @@ static void RenderFrame(const uint8_t *nv12)
     // restore states
     nb = 0;
     bars[nb++] = Trans(backbuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-    bars[nb++] = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    bars[nb++] = Trans(processedFrame, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     if (IsComparisonView())
-        bars[nb++] = Trans(g_orig_rgba.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        bars[nb++] = Trans(originalFrame, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (usingVSR) {
+        if (usingVSRSharpen)
+            bars[nb++] = Trans(g_vsr_rgba.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        bars[nb++] = Trans(g_stage_rgba.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        if (IsComparisonView())
+            bars[nb++] = Trans(g_orig_rgba.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
     bars[nb++] = Trans(g_nr_out.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g_list->ResourceBarrier(nb, bars);
 
@@ -2798,6 +3302,14 @@ static int PlayVideo(const std::wstring &input)
                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     g_orig_rgba  = MakeTex(g_vid_w, g_vid_h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    // Allocate the selected VSR output size once per video. They remain idle while VSR is off.
+    g_vsr_rgba = MakeTex(g_vid_w * g_vsr_scale, g_vid_h * g_vsr_scale, DXGI_FORMAT_R8G8B8A8_UNORM,
+                         D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    g_vsr_sharp_rgba = MakeTex(g_vid_w * g_vsr_scale, g_vid_h * g_vsr_scale, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    g_orig_vsr_rgba = MakeTex(g_vid_w * g_vsr_scale, g_vid_h * g_vsr_scale, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if (!g_vsr_rgba || !g_vsr_sharp_rgba || !g_orig_vsr_rgba) Fatal("VSR texture allocation failed");
 
     // staging (upload) buffer: Y plane (padded) then UV plane (padded)
     D3D12_RESOURCE_DESC sbd = {};
@@ -2833,7 +3345,7 @@ static int PlayVideo(const std::wstring &input)
         D3D12_RESOURCE_DESC rbd = {};
         rbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
         rbd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-        rbd.Width = (UINT64)((g_vid_w * 8 + 255) & ~255u) * g_vid_h;
+        rbd.Width = (UINT64)((FinalFrameWidth() * 4 + 255) & ~255u) * FinalFrameHeight();
         rbd.Height = 1; rbd.DepthOrArraySize = 1; rbd.MipLevels = 1;
         rbd.SampleDesc.Count = 1; rbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_HEAP_PROPERTIES rhp = {};
@@ -2888,16 +3400,11 @@ static int PlayVideo(const std::wstring &input)
                 continue;
             }
             if (msg.message == WM_KEYDOWN && msg.wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) { OpenVideoDialog(g_hwnd); continue; }
-            if (msg.message == WM_KEYDOWN && (msg.wParam == 'S' || msg.wParam == 'D' || msg.wParam == 'M' || msg.wParam == 'P'))
-            {
-                if (!(msg.lParam & (1LL << 30))) {
-                    if (msg.wParam == 'S') ToggleComparison();
-                    else if (msg.wParam == 'D') ToggleNR();
-                    else if (msg.wParam == 'M') CycleModel();
-                    else CyclePasses();
-                }
+            if (msg.message == WM_KEYDOWN && IsPlayerHotkey(msg.wParam)) {
+                if (!(msg.lParam & (1LL << 30))) HandlePlayerHotkey(msg.wParam);
                 continue;
             }
+            if (msg.message == WM_CHAR && IsPlayerHotkey(towupper((wchar_t)msg.wParam))) continue;
             if (msg.message == WM_KEYDOWN && msg.wParam == VK_SPACE && msg.hwnd != g_mute_button)
             {
                 if (!(msg.lParam & (1LL << 30))) TogglePause();
@@ -3035,10 +3542,10 @@ static void CleanupPlayback()
     ReleaseNGXObjects();
     Log("cleanup: resources");
     g_swap.Reset(); g_readback.Reset();
-    g_pso_in.Reset(); g_pso_out.Reset(); g_pso_blend.Reset(); g_rs.Reset(); g_cbv_heap.Reset();
+    g_pso_in.Reset(); g_pso_out.Reset(); g_pso_blend.Reset(); g_pso_scale.Reset(); g_pso_sharpen.Reset(); g_rs.Reset(); g_cbv_heap.Reset();
     g_y_tex.Reset(); g_uv_tex.Reset(); g_staging.Reset(); g_nr_in.Reset();
     g_nr_out.Reset(); g_nr_mid.clear();
-    g_stage_rgba.Reset(); g_orig_rgba.Reset(); g_list.Reset();
+    g_stage_rgba.Reset(); g_orig_rgba.Reset(); g_vsr_rgba.Reset(); g_vsr_sharp_rgba.Reset(); g_orig_vsr_rgba.Reset(); g_list.Reset();
     for (UINT i = 0; i < FRAMES_IN_FLIGHT; ++i) {
         g_cmd_alloc[i].Reset(); g_fence[i].Reset(); g_fence_value[i] = 0;
     }
@@ -3142,15 +3649,16 @@ int wmain(int argc, wchar_t **argv)
         }
         if (message.message == WM_KEYDOWN) {
             if (message.wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) { OpenVideoDialog(g_hwnd); continue; }
-            if (message.wParam == 'S') { ToggleComparison(); continue; }
-            if (message.wParam == 'D') { ToggleNR(); continue; }
-            if (message.wParam == 'M') { CycleModel(); continue; }
-            if (message.wParam == 'P') { CyclePasses(); continue; }
+            if (IsPlayerHotkey(message.wParam)) {
+                if (!(message.lParam & (1LL << 30))) HandlePlayerHotkey(message.wParam);
+                continue;
+            }
             if (message.wParam == VK_F11) { ToggleFullscreen(); continue; }
             if (message.wParam == VK_LEFT && !IsModernSlider(message.hwnd) && message.hwnd != g_passes_edit) { RequestFrameStep(-1); continue; }
             if (message.wParam == VK_RIGHT && !IsModernSlider(message.hwnd) && message.hwnd != g_passes_edit) { RequestFrameStep(1); continue; }
             if (message.wParam == VK_ESCAPE && g_fullscreen) { ToggleFullscreen(); continue; }
         }
+        if (message.message == WM_CHAR && IsPlayerHotkey(towupper((wchar_t)message.wParam))) continue;
         TranslateMessage(&message); DispatchMessageW(&message);
     }
     ReleaseIconAssets();

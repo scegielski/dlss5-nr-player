@@ -11,7 +11,10 @@ def main():
     options = parser.parse_args()
     files = ['nr_player.exe', 'pause.png', 'frame_back.png', 'frame_forward.png', 'mute.png', 'volume.png', 'full-screen.png',
              'ffmpeg.exe', 'ffprobe.exe', '_nvngx.dll',
-             'nvngx_dlssnr.dll', 'caller/nvngx.dll', 'runtime40/nvngx_dlssnr.dll']
+             'nvngx_dlssnr.dll', 'caller/nvngx.dll', 'runtime40/nvngx_dlssnr.dll',
+             'vsr/nvngx_vsr.dll', 'THIRD_PARTY_NOTICES.md',
+             'third_party/NVIDIA_RTX_Video_SDK_License.pdf',
+             'third_party/COPYING.GPLv3']
     missing = [name for name in files if not (project / name).is_file()]
     if missing:
         parser.error('Missing local dependencies: ' + ', '.join(missing) + '. See README.md.')
