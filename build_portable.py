@@ -9,16 +9,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dist-dir', type=Path, default=project / 'dist')
     options = parser.parse_args()
-    files = ['nr_player.exe', 'ffmpeg.exe', 'ffprobe.exe', '_nvngx.dll',
-             'nvngx_dlssnr.dll', 'caller/nvngx.dll', 'runtime40/nvngx_dlssnr.dll']
+    files = ['nr_player.exe', 'pause.png', 'frame_back.png', 'frame_forward.png', 'mute.png', 'volume.png', 'full-screen.png',
+             'ffmpeg.exe', 'ffprobe.exe', '_nvngx.dll',
+             'nvngx_dlssnr.dll', 'caller/nvngx.dll', 'runtime40/nvngx_dlssnr.dll',
+             'vsr/nvngx_vsr.dll', 'THIRD_PARTY_NOTICES.md',
+             'third_party/NVIDIA_RTX_Video_SDK_License.pdf',
+             'third_party/COPYING.GPLv3']
     missing = [name for name in files if not (project / name).is_file()]
     if missing:
         parser.error('Missing local dependencies: ' + ', '.join(missing) + '. See README.md.')
     ffi_candidates = [Path(sys.prefix) / 'Library' / 'bin' / 'ffi.dll',
-                      Path(sys.prefix) / 'ffi.dll']
+                      Path(sys.prefix) / 'ffi.dll',
+                      Path(sys.prefix) / 'DLLs' / 'libffi-8.dll',
+                      Path(sys.base_prefix) / 'DLLs' / 'libffi-8.dll']
     ffi_dll = next((path for path in ffi_candidates if path.is_file()), None)
     if ffi_dll is None:
-        parser.error('Could not find ffi.dll required by Python ctypes. '
+        parser.error('Could not find ffi.dll or libffi-8.dll required by Python ctypes. '
                      'Install libffi in the active Python environment.')
     try:
         from PyInstaller.__main__ import run

@@ -16,9 +16,15 @@ This repository contains **source code only**. NVIDIA DLLs, the caller helper, F
 - Step one frame backward or forward with the **Previous Frame** / **Next Frame** buttons or the **Left** / **Right Arrow** keys. Stepping pauses playback and displays the selected frame.
 - Click or drag the seek bar to jump to the pointer position. Seeking while paused displays a preview without resuming playback.
 - Resize the window: the video keeps its original aspect ratio with black letterbox or pillarbox bars, while controls remain visible below it and wrap when needed.
-- **Split** button / **S**: toggle original (left) versus DLSS 5 (right). Split view defaults off.
-- **DLSS 5** button / **D**: toggle neural processing in single view. DLSS defaults on. Comparison always includes DLSS, so the DLSS toggle is disabled there; returning to single view restores the previous setting.
+- Scroll the mouse wheel over the video to zoom from `1x` to `8x`; drag with the middle mouse button to pan the zoomed frame. Zoom and pan also preserve Wipe mode alignment and divider interaction.
+- **View mode** button / **S**: cycle **Normal**, **Split**, and **Wipe**. Split places the original and DLSS 5 frames side by side. Wipe overlays them, with the original left of a draggable vertical divider and DLSS 5 to its right.
+- **DLSS 5** button / **D**: toggle neural processing in Normal or Wipe view. Split view always includes DLSS, so the toggle is disabled there. Turning DLSS off in Wipe view temporarily hides and disables the wipe comparison while preserving that selected mode and divider position.
+- **Intensity** slider: blend the original and DLSS frames from `0.00` to `2.00` in `0.01` increments. `0.00` is the original, `1.00` is the normal DLSS result, and values above `1.00` amplify the DLSS difference. This post-process blend does not disturb DLSS temporal state and applies immediately, including while paused.
+- **Tone** and **Structure** sliders: adjust the native `DLSSNR.LocalToneStrength` and `DLSSNR.LocalStructureStrength` parameters from `0.00` to `2.00` in `0.01` increments. Changes apply to every active NR pass.
 - **Model** button / **M**: cycle between the Default, Natural, and Cinematic DLSS 5 models. The new model is applied immediately and also works while paused.
+- **VSR** button / **U**: enable NVIDIA RTX Video Super Resolution after DLSS 5 NR. **Scale** / **V** cycles 2x, 4x, and 6x; **Quality** / **Q** cycles Low, Medium, High, and Ultra. It is off by default. The player checks the NVIDIA NGX `VSR.Available` capability at startup; unsupported GPUs, drivers, or missing VSR runtimes leave the control disabled and preserve normal playback. Split and Wipe use a separately GPU-scaled original at the final VSR dimensions, so the comparisons remain aligned. The VSR feature uses each newly decoded/NR frame only once, including after pause, seek, and frame stepping.
+- **Multipass** checkbox: off by default so DLSS 5 NR runs a single feature-18 instance for the fastest possible playback (the original single-pass baseline). Check it to probe and enable the full multipass cascade; toggling while a video is loaded rebuilds the NGX feature set on the fly (a brief stall while the GPU drains and features are re-created).
+- **Passes** slider / **P**: set the DLSS 5 NR multipass cascade depth from 1 up to `MAX_NR_PASSES` (11); only usable once **Multipass** is checked. 1 pass is normal single-pass DLSS 5 NR; each additional pass adds another independent feature instance (its own temporal history) to the cascade before the final stage. When multipass is enabled the player probes the runtime by creating feature instances one at a time until creation fails, and the slider range is clamped to however many the GPU/driver actually supports that session. More passes can increase enhancement but may also increase temporal persistence, smearing/ghosting, settling time after cuts, and GPU/VRAM load — leave **Multipass** unchecked for real-time playback. Multipass uses the same existing DLSS NR runtime; no additional NVIDIA DLL is required. The slider and hotkey are disabled when DLSS 5 NR is unavailable, multipass is off, or only 1 pass is supported.
 - View controls also work while paused. The title shows the current mode. **Esc** closes the player.
 - Build a single-file portable executable containing your locally supplied dependencies. It opens without a batch-file launcher.
 
@@ -58,6 +64,7 @@ Place these files relative to `nr_player.exe`. Original-only playback requires o
 | `nvngx_dlssnr.dll` | Original RTX50 NR runtime from a legitimate DLSS5 application or the original NR-Media-UI RTX50 release |
 | `runtime40/nvngx_dlssnr.dll` | Community Ada runtime from the author's [NR-Media-UI v1.1.0 RTX40 release](https://github.com/perseval-BLR/NR-Media-UI/releases/tag/v1.1.0) |
 | `caller/nvngx.dll` | Caller wrapper from NR-Media-UI; its PyInstaller executable embeds this helper. It must export `DLSSNR_CallInit`, `DLSSNR_CallCreate`, `DLSSNR_CallEvaluate`, and `DLSSNR_CallRelease`. The driver's ordinary `nvngx.dll` is not a substitute. |
+| `vsr/nvngx_vsr.dll` | NVIDIA RTX Video SDK VSR runtime. For development, use `bin\Windows\x64\dev\nvngx_vsr.dll`; use the SDK's `rel` DLL for a release build only after meeting its applicable redistribution and notice requirements. This repository does not include it. |
 | `ffmpeg.exe`, `ffprobe.exe` | FFmpeg, available through [FFmpeg's download page](https://ffmpeg.org/download.html). CUDA decoding is used on NVIDIA adapters when supported; other adapters use normal software decoding. Native use can also resolve these from PATH. |
 
 The two NR runtimes stay separate; the original RTX50 file is not overwritten with the patch. The selected DLL path is logged. `nvngx_dlss.dll` (Super Resolution) is not used by this player, although the upstream DX11 bridge uses it.
@@ -87,10 +94,13 @@ Without `--gui`, a command-line input exits at EOF. The legacy `NR_player.bat` f
 | `--gpu N` | DXGI adapter index |
 | `--nr-only` | Single view (default) |
 | `--side-by-side` | Start in comparison view |
+| `--wipe` | Start in draggable wipe comparison view |
 | `--style natural\|cinematic` | NR style |
 | `--preset N` | Render preset (default 3) |
-| `--intensity N`, `--tone N`, `--structure N` | NR tuning |
+| `--intensity F` | Original/DLSS blend intensity from `0.00` to `2.00` |
+| `--tone F`, `--structure F` | Native local tone and structure strengths from `0.00` to `2.00` |
 | `--skin N`, `--mask N` | Skin structure / automatic mask |
+| `--passes N` | DLSS 5 NR multipass cascade depth, `1` (default) to `11`. Values outside `1..11` are rejected (falls back to `1`) and logged; the value is also clamped to whatever pass count the runtime actually supports on this GPU/driver. Passing `N > 1` automatically enables multipass (equivalent to checking the **Multipass** box); `--passes 1` (or omitting the option) leaves the fast single-pass baseline in effect. |
 | `--fast` | Disable frame pacing |
 | `--output out.mp4` | Offline conversion with original audio |
 | `--crf N` | Output H.264 CRF (default 18) |
@@ -109,7 +119,7 @@ The result is `dist/DLSS 5 NR Player.exe`. `--dist-dir PATH` selects another out
 
 The portable launcher extracts its payload to a temporary directory, launches the native GUI without a console, and waits until it closes before cleanup. No installed Python, FFmpeg, or source checkout is needed on the target computer. A Direct3D 12-compatible GPU and driver are still necessary. Diagnostics are written to `%TEMP%\DLSS5-NR-Player.log`.
 
-The packaging recipe is for your local dependencies. Check the applicable licenses before sharing a package containing NVIDIA or other third-party binaries. This fork does not publish those binaries.
+Portable release assets include locally supplied runtime files and the accompanying `THIRD_PARTY_NOTICES.md`, NVIDIA RTX Video SDK license, and GPLv3 license. FFmpeg 9.0.1 source corresponding to the bundled Gyan essentials build is available at the commit linked in the notices. NVIDIA components remain NVIDIA property and are subject to NVIDIA's terms; this project grants no additional rights to them.
 
 ## Validation
 
@@ -127,5 +137,6 @@ The test checks runtime selection for RTX40, RTX50, Ti/Super/laptop variants, an
 - Original player, conversion pipeline, NGX integration and experiments: [Zonnery/dlss5-nr-player](https://github.com/Zonnery/dlss5-nr-player).
 - Runtime/helper release source: [perseval-BLR/NR-Media-UI](https://github.com/perseval-BLR/NR-Media-UI). Its RTX40 README credits the community patch to Uncle Burrito / dev-camo.
 - NVIDIA DLSS/NGX names and binaries belong to NVIDIA and remain subject to their own terms.
+- The portable build uses FFmpeg 9.0.1 essentials from Gyan, licensed as GPLv3; see `THIRD_PARTY_NOTICES.md` in the repository and packaged application for license and source links.
 
 This is an experimental community project. Upstream history and attribution are preserved; this fork does not add a new license grant for upstream or third-party material.
